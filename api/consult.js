@@ -1,13 +1,43 @@
 // /api/consult.js — the reading engine for Solving My Problems.
 //
-// Runs server-side so the Anthropic API key never reaches the browser and every
-// reading-consumption decision happens here. For T1 the gate is stubbed to
-// "allow" behind GATING_ENABLED, so the free first reading works with no login
-// and the app is a live demo on day one. T2 flips the flag on and wires the
-// Supabase JWT + credit/subscription gate into the block below.
+// Runs server-side so the Anthropic API key never reaches the browser and so
+// that every reading-consumption decision happens here. Client-side gating
+// would mean free unlimited readings for anyone with devtools.
+//
+// GATING_ENABLED off  -> allow every reading (the T1 demo: no login required).
+// GATING_ENABLED on   -> verify the Supabase JWT and gate, in order:
+//                        active subscription -> allow
+//                        else spend_credit()    -> allow
+//                        else use_free_reading() -> allow
+//                        else 402 payment_required (client opens the paywall).
+
+import { createClient } from "@supabase/supabase-js";
 
 const GATING_ENABLED = process.env.GATING_ENABLED === "true";
 const PROBLEM_MAX = 600;
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+let adminClient = null;
+// Service-role client. Bypasses RLS, so it must never be built from anything
+// the browser sends — only from server-only env vars.
+function admin() {
+  if (!adminClient) {
+    adminClient = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+  }
+  return adminClient;
+}
+
+function subscriptionIsActive(sub) {
+  if (!sub) return false;
+  if (sub.status !== "active" && sub.status !== "trialing") return false;
+  if (sub.current_period_end && new Date(sub.current_period_end).getTime() < Date.now()) {
+    return false;
+  }
+  return true;
+}
 
 // The reading prompt — kept verbatim from the approved mockup's consultTheTools,
 // including the compatibility-mode block and every safety guardrail. Do not edit
@@ -61,6 +91,73 @@ async function generateReading(prompt) {
   return JSON.parse(text.replace(/```json|```/g, "").trim());
 }
 
+// Returns { userId, spentCredit } when the reading is allowed, or null after it
+// has already responded (402/401/500).
+async function runGate(req, res) {
+  if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
+    console.error("consult: GATING_ENABLED is on but Supabase env vars are missing");
+    res.status(500).json({ error: "server_misconfigured" });
+    return null;
+  }
+
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+  if (!token) {
+    res.status(401).json({ error: "unauthorized" });
+    return null;
+  }
+
+  const { data: userData, error: userError } = await admin().auth.getUser(token);
+  if (userError || !userData?.user) {
+    res.status(401).json({ error: "unauthorized" });
+    return null;
+  }
+  const userId = userData.user.id;
+
+  const { data: sub, error: subError } = await admin()
+    .from("subscriptions")
+    .select("status, current_period_end")
+    .eq("profile_id", userId)
+    .maybeSingle();
+  if (subError) console.warn("consult: subscription lookup failed —", subError.message);
+
+  if (subscriptionIsActive(sub)) return { userId, spentCredit: false };
+
+  const { data: spent, error: spendError } = await admin().rpc("spend_credit", { p_user: userId });
+  if (spendError) {
+    console.error("consult: spend_credit failed —", spendError.message);
+    res.status(500).json({ error: "gate_failed" });
+    return null;
+  }
+  if (spent === true) return { userId, spentCredit: true };
+
+  const { data: usedFree, error: freeError } = await admin().rpc("use_free_reading", { p_user: userId });
+  if (freeError) {
+    console.error("consult: use_free_reading failed —", freeError.message);
+    res.status(500).json({ error: "gate_failed" });
+    return null;
+  }
+  if (usedFree === true) return { userId, spentCredit: false };
+
+  res.status(402).json({ error: "payment_required" });
+  return null;
+}
+
+// Users never pay for our errors: hand the credit back if generation failed
+// after we spent one.
+async function refundCredit(userId) {
+  const { error } = await admin().rpc("grant_credits", {
+    p_user: userId,
+    p_delta: 1,
+    p_reason: "refund_error",
+    p_stripe_ref: null,
+  });
+  if (error) {
+    // Loud: this is money. Needs manual reconciliation if it ever fires.
+    console.error(`consult: REFUND FAILED for ${userId} — ${error.message}`);
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -88,28 +185,23 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "problem_too_long" });
   }
 
-  // --- Gate (T1: stubbed to allow) ------------------------------------------
-  // T2 replaces this block: verify the Supabase JWT -> user id, load the
-  // subscription, then decide in order — active subscription -> allow; else
-  // spend_credit(user) true -> allow; else use_free_reading(user) true -> allow
-  // and increment; else respond 402 { error: "payment_required" } so the client
-  // opens the paywall. On a generate failure AFTER a credit was spent, refund
-  // via a +1 credit_ledger insert so users never pay for errors.
+  const birthdate = body.birthdate || "";
+  const birthtime = body.birthtime || "";
+  const birthplace = body.birthplace || "";
+  const partnerName = body.partnerName || "";
+  const partnerBirthdate = body.partnerBirthdate || "";
+  const mode = body.mode === "duo" || partnerBirthdate ? "duo" : "solo";
+
+  let userId = null;
+  let spentCredit = false;
   if (GATING_ENABLED) {
-    // The real gate is not wired yet (arrives in T2). Fail closed rather than
-    // silently handing out free unlimited readings if the flag is flipped early.
-    console.error("consult: GATING_ENABLED is on but the gate is not implemented yet (T2)");
-    return res.status(501).json({ error: "gating_not_implemented" });
+    const gate = await runGate(req, res);
+    if (!gate) return; // runGate already responded (401/402/500)
+    userId = gate.userId;
+    spentCredit = gate.spentCredit;
   }
 
-  const prompt = buildPrompt({
-    problem,
-    birthdate: body.birthdate,
-    birthtime: body.birthtime,
-    birthplace: body.birthplace,
-    partnerName: body.partnerName,
-    partnerBirthdate: body.partnerBirthdate,
-  });
+  const prompt = buildPrompt({ problem, birthdate, birthtime, birthplace, partnerName, partnerBirthdate });
 
   // Generate; on a parse/HTTP failure retry once, then 502.
   let reading;
@@ -121,8 +213,26 @@ export default async function handler(req, res) {
       reading = await generateReading(prompt);
     } catch (second) {
       console.error("consult: failed after retry —", second.message);
+      if (spentCredit) await refundCredit(userId);
       return res.status(502).json({ error: "reading_failed" });
     }
+  }
+
+  // Store the reading (service role). A failure here must not cost the user the
+  // reading they just paid for, so log and still return it.
+  if (userId) {
+    const { error } = await admin()
+      .from("readings")
+      .insert({
+        profile_id: userId,
+        problem,
+        mode,
+        partner_name: partnerName || null,
+        partner_birthdate: partnerBirthdate || null,
+        birthdate: birthdate || null,
+        result: reading,
+      });
+    if (error) console.error("consult: storing reading failed —", error.message);
   }
 
   return res.status(200).json(reading);

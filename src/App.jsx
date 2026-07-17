@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Sparkles, Moon, Hash, Compass, CircleDot, ScrollText, RefreshCw, Share2, Heart, X, Lock, Sun } from "lucide-react";
+import { supabase, isSupabaseConfigured } from "./supabaseClient";
 
 // ------------------------------------------------------------------
 // SOLVING MY PROBLEMS — solvingmyproblems.com
@@ -46,13 +47,16 @@ const STARS = Array.from({ length: 40 }, (_, i) => ({
   tw: 2.2 + (i % 5) * 0.7,
 }));
 
-async function consultTheTools({ problem, birthdate, birthtime, birthplace, partnerName, partnerBirthdate }) {
+async function consultTheTools({ problem, birthdate, birthtime, birthplace, partnerName, partnerBirthdate, token }) {
   // The reading engine (the Anthropic call plus the prompt and its safety
   // guardrails) runs server-side in /api/consult, so the API key never reaches
   // the browser and every reading-consumption decision stays on the server.
   const response = await fetch("/api/consult", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify({
       problem,
       birthdate,
@@ -63,23 +67,46 @@ async function consultTheTools({ problem, birthdate, birthtime, birthplace, part
       mode: partnerBirthdate ? "duo" : "solo",
     }),
   });
+  // Out of free readings and credits — the caller opens the paywall.
+  if (response.status === 402) {
+    const paymentRequired = new Error("payment_required");
+    paymentRequired.code = "payment_required";
+    throw paymentRequired;
+  }
   if (!response.ok) throw new Error(`consult failed (${response.status})`);
   return response.json();
 }
 
 // ---------- Daily Card: subscriber ritual — one-card morning pull ----------
-async function pullDailyCard({ birthdate }) {
+async function pullDailyCard({ token }) {
   // Subscriber daily pull, generated and cached per day server-side in
   // /api/daily-card (wired up in a later milestone; gated on an active sub).
   const now = new Date();
   const day = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
   const response = await fetch("/api/daily-card", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify({ day }),
   });
   if (!response.ok) throw new Error(`daily-card failed (${response.status})`);
   return response.json();
+}
+
+// A subscription only counts while Stripe says it is live.
+function subscriptionIsActive(sub) {
+  if (!sub) return false;
+  if (sub.status !== "active" && sub.status !== "trialing") return false;
+  if (sub.current_period_end && new Date(sub.current_period_end).getTime() < Date.now()) return false;
+  return true;
+}
+
+async function getAccessToken() {
+  if (!supabase) return null;
+  const { data } = await supabase.auth.getSession();
+  return data?.session?.access_token ?? null;
 }
 
 function Label({ children }) {
@@ -140,13 +167,92 @@ export default function SolvingMyProblems() {
   // --- Daily Card (subscriber ritual) ---
   const [daily, setDaily] = useState(null);
   const [dailyLoading, setDailyLoading] = useState(false);
+  // --- Account + checkout ---
+  const [user, setUser] = useState(null);
+  const [checkoutBusy, setCheckoutBusy] = useState("");
+  const [checkoutError, setCheckoutError] = useState("");
+  const [authStep, setAuthStep] = useState(""); // "" | "attach" | "signin"
+  const [pendingSku, setPendingSku] = useState("");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const [authNote, setAuthNote] = useState("");
+
+  const hasEmail = Boolean(user && !user.is_anonymous && user.email);
+
+  // Boot: anonymous-first. The free reading needs no login, and because the
+  // anonymous user is a real auth.users row, the profiles trigger, RLS and the
+  // free-reading counter all work identically. At purchase the SAME account is
+  // converted, so credits and history carry over.
+  useEffect(() => {
+    if (!isSupabaseConfigured) return;
+    let cancelled = false;
+    (async () => {
+      const { data } = await supabase.auth.getSession();
+      let session = data?.session ?? null;
+      if (!session) {
+        const { data: anon, error: anonError } = await supabase.auth.signInAnonymously();
+        if (anonError) console.error("anonymous sign-in failed:", anonError.message);
+        session = anon?.session ?? null;
+      }
+      if (!cancelled) setUser(session?.user ?? null);
+    })();
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+    return () => {
+      cancelled = true;
+      listener?.subscription?.unsubscribe();
+    };
+  }, []);
+
+  // Real credits / subscription / free-reading counter, straight from the
+  // tables (select-own via RLS). The server is what actually decides.
+  const refreshProfile = useCallback(async () => {
+    if (!supabase || !user) return null;
+    const [{ data: profile }, { data: sub }] = await Promise.all([
+      supabase.from("profiles").select("free_readings_used, credits").eq("id", user.id).maybeSingle(),
+      supabase.from("subscriptions").select("status, current_period_end").eq("profile_id", user.id).maybeSingle(),
+    ]);
+    const active = subscriptionIsActive(sub);
+    if (profile) {
+      setCredits(profile.credits ?? 0);
+      setReadingsUsed(profile.free_readings_used ?? 0);
+    }
+    setSubscribed(active);
+    return { credits: profile?.credits ?? 0, subscribed: active };
+  }, [user]);
+
+  useEffect(() => {
+    refreshProfile();
+  }, [refreshProfile]);
+
+  // Back from Stripe. The webhook may still be in flight, so poll briefly
+  // instead of showing a stale balance.
+  useEffect(() => {
+    if (!user) return undefined;
+    const params = new URLSearchParams(window.location.search);
+    const checkout = params.get("checkout");
+    if (!checkout) return undefined;
+    window.history.replaceState({}, "", window.location.pathname);
+    if (checkout !== "success") return undefined;
+    let cancelled = false;
+    (async () => {
+      for (let i = 0; i < 6 && !cancelled; i++) {
+        const state = await refreshProfile();
+        if (state && (state.credits > 0 || state.subscribed)) return;
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user, refreshProfile]);
 
   async function handleConsult() {
-    // First reading free (no login). After that: a credit or the subscription.
-    if (readingsUsed >= 1 && !subscribed) {
-      if (credits <= 0) { setShowPaywall(true); return; }
-      setCredits((c) => c - 1);
-    }
+    // The server decides, in order: subscription, then a credit, then the free
+    // reading. A 402 means it is time to pay.
     setLoading(true);
     setError("");
     try {
@@ -154,13 +260,133 @@ export default function SolvingMyProblems() {
         problem, birthdate, birthtime, birthplace,
         partnerName: mode === "duo" ? partnerName : "",
         partnerBirthdate: mode === "duo" ? partnerBirthdate : "",
+        token: await getAccessToken(),
       });
       setReading(r);
-      setReadingsUsed((n) => n + 1);
+      await refreshProfile();
     } catch (e) {
-      setError("The tools are being temperamental. Give it another try in a moment.");
+      if (e.code === "payment_required") setShowPaywall(true);
+      else setError("The tools are being temperamental. Give it another try in a moment.");
     }
     setLoading(false);
+  }
+
+  async function startCheckout(sku) {
+    setCheckoutError("");
+    setCheckoutBusy(sku);
+    try {
+      const token = await getAccessToken();
+      const response = await fetch("/api/create-checkout-session", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ sku }),
+      });
+      // Anonymous account: attach an email to this same user first, then retry.
+      if (response.status === 409) {
+        setPendingSku(sku);
+        setAuthError("");
+        setAuthNote("");
+        setAuthStep("attach");
+        return;
+      }
+      if (!response.ok) throw new Error(`checkout failed (${response.status})`);
+      const { url } = await response.json();
+      window.location.href = url;
+    } catch (e) {
+      setCheckoutError("Checkout is being temperamental. Give it another try in a moment.");
+    } finally {
+      setCheckoutBusy("");
+    }
+  }
+
+  // Converts the anonymous account in place: same user id, so credits and
+  // history survive.
+  async function attachEmail(e) {
+    e.preventDefault();
+    setAuthBusy(true);
+    setAuthError("");
+    setAuthNote("");
+    try {
+      const { error: updateError } = await supabase.auth.updateUser({
+        email: authEmail,
+        password: authPassword,
+      });
+      if (updateError) throw updateError;
+      const { data } = await supabase.auth.getUser();
+      if (data?.user?.is_anonymous) {
+        // This project has email confirmation on: the account only converts
+        // once the link is clicked.
+        setAuthNote("Check your inbox to confirm that address, then choose your plan again.");
+        return;
+      }
+      setUser(data?.user ?? null);
+      setAuthStep("");
+      const sku = pendingSku;
+      setPendingSku("");
+      if (sku) await startCheckout(sku);
+    } catch (err) {
+      setAuthError(err.message || "Could not save that address. Try another one.");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function signIn(e) {
+    e.preventDefault();
+    setAuthBusy(true);
+    setAuthError("");
+    setAuthNote("");
+    try {
+      const { error: signInError } = await supabase.auth.signInWithPassword({
+        email: authEmail,
+        password: authPassword,
+      });
+      if (signInError) throw signInError;
+      setAuthStep("");
+      setAuthPassword("");
+    } catch (err) {
+      setAuthError(err.message || "That email and password did not match.");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function forgotPassword() {
+    if (!authEmail) {
+      setAuthError("Enter your email first.");
+      return;
+    }
+    setAuthBusy(true);
+    setAuthError("");
+    setAuthNote("");
+    try {
+      const { error: resetError } = await supabase.auth.resetPasswordForEmail(authEmail, {
+        redirectTo: window.location.origin,
+      });
+      if (resetError) throw resetError;
+      setAuthNote("Recovery link sent. Check your inbox.");
+    } catch (err) {
+      setAuthError(err.message || "Could not send that. Try again in a moment.");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function signOut() {
+    await supabase.auth.signOut();
+    setReading(null);
+    setDaily(null);
+    setCredits(0);
+    setSubscribed(false);
+    setReadingsUsed(0);
+    setAuthEmail("");
+    setAuthPassword("");
+    // Straight back to a fresh anonymous session so the app keeps working.
+    const { data } = await supabase.auth.signInAnonymously();
+    setUser(data?.session?.user ?? null);
   }
 
   return (
@@ -262,7 +488,7 @@ export default function SolvingMyProblems() {
               ) : (
                 <button
                   disabled={dailyLoading}
-                  onClick={async () => { setDailyLoading(true); try { setDaily(await pullDailyCard({ birthdate })); } catch {} setDailyLoading(false); }}
+                  onClick={async () => { setDailyLoading(true); try { setDaily(await pullDailyCard({ token: await getAccessToken() })); } catch {} setDailyLoading(false); }}
                   className="mt-3 w-full rounded-xl py-3 text-sm font-bold transition-all active:scale-[.99]"
                   style={{ background: P.goldSoft, color: P.gold, border: `1px solid ${P.gold}55` }}
                 >
@@ -377,29 +603,74 @@ export default function SolvingMyProblems() {
 
         {/* Paywall — first reading free, then credits or unlimited */}
         {showPaywall && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-6" style={{ background: "rgba(10,10,26,.85)" }} onClick={() => setShowPaywall(false)}>
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-6" style={{ background: "rgba(10,10,26,.85)" }} onClick={() => { setShowPaywall(false); setAuthStep(""); }}>
             <div className="w-full max-w-sm rounded-3xl p-6" style={{ background: P.nightSoft, border: "1px solid #2E3060" }} onClick={(e) => e.stopPropagation()}>
               <div className="flex items-center justify-between">
                 <h2 className="smp-display text-2xl font-semibold" style={{ color: P.parchment }}>The tools await</h2>
-                <button onClick={() => setShowPaywall(false)}><X size={18} style={{ color: P.faint }} /></button>
+                <button onClick={() => { setShowPaywall(false); setAuthStep(""); }}><X size={18} style={{ color: P.faint }} /></button>
               </div>
-              <p className="text-sm mt-1" style={{ color: P.faint }}>Your first reading was on the house. Choose how you continue:</p>
-              <div className="mt-4 space-y-2.5">
-                <button onClick={() => { setCredits((c) => c + 1); setShowPaywall(false); }} className="w-full rounded-xl p-4 text-left border transition-all active:scale-[.99]" style={{ borderColor: "#2E3060", background: P.night }}>
-                  <p className="font-bold text-sm" style={{ color: P.parchment }}>One reading <span className="float-right" style={{ color: P.gold }}>$1.99</span></p>
-                  <p className="text-xs mt-0.5" style={{ color: P.faint }}>For tonight's problem</p>
-                </button>
-                <button onClick={() => { setCredits((c) => c + 5); setShowPaywall(false); }} className="w-full rounded-xl p-4 text-left border transition-all active:scale-[.99]" style={{ borderColor: P.gold, background: P.night }}>
-                  <p className="font-bold text-sm" style={{ color: P.parchment }}>Five readings <span className="float-right" style={{ color: P.gold }}>$7.97</span></p>
-                  <p className="text-xs mt-0.5" style={{ color: P.faint }}>Problems rarely travel alone · save 20%</p>
-                </button>
-                <button onClick={() => { setSubscribed(true); setShowPaywall(false); }} className="w-full rounded-xl p-4 text-left transition-all active:scale-[.99]" style={{ background: P.goldSoft, border: `1px solid ${P.gold}` }}>
-                  <p className="font-bold text-sm" style={{ color: P.gold }}>Unlimited + the Daily Card <span className="float-right">$4.99/mo</span></p>
-                  <p className="text-xs mt-0.5" style={{ color: "#C9C7E3" }}>Every problem, plus one card every morning</p>
-                </button>
-              </div>
-              <p className="text-[10px] text-center mt-3" style={{ color: P.faint }}>Demo buttons — production wires these to Stripe/Lemon Squeezy checkout.</p>
+              {authStep === "attach" ? (
+                <form onSubmit={attachEmail} className="mt-4 space-y-4">
+                  <p className="text-sm" style={{ color: P.faint }}>Where should we keep your readings? Your free one comes with you.</p>
+                  <Field label="Email" type="email" required value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="you@example.com" />
+                  <Field label="Password" type="password" required minLength={8} value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} placeholder="At least 8 characters" />
+                  {authError && <p className="text-sm" style={{ color: P.rose }}>{authError}</p>}
+                  {authNote && <p className="text-sm" style={{ color: P.lavender }}>{authNote}</p>}
+                  <button type="submit" disabled={authBusy} className="w-full rounded-xl py-3.5 font-bold text-sm transition-all active:scale-[.99] disabled:opacity-40" style={{ background: P.gold, color: P.night }}>
+                    {authBusy ? "One moment…" : "Continue to checkout"}
+                  </button>
+                  <button type="button" onClick={() => setAuthStep("")} className="w-full py-1 text-xs font-bold" style={{ color: P.faint }}>Back</button>
+                </form>
+              ) : (
+                <>
+                  <p className="text-sm mt-1" style={{ color: P.faint }}>Your first reading was on the house. Choose how you continue:</p>
+                  <div className="mt-4 space-y-2.5">
+                    <button disabled={Boolean(checkoutBusy)} onClick={() => startCheckout("single")} className="w-full rounded-xl p-4 text-left border transition-all active:scale-[.99] disabled:opacity-40" style={{ borderColor: "#2E3060", background: P.night }}>
+                      <p className="font-bold text-sm" style={{ color: P.parchment }}>One reading <span className="float-right" style={{ color: P.gold }}>$1.99</span></p>
+                      <p className="text-xs mt-0.5" style={{ color: P.faint }}>For tonight's problem</p>
+                    </button>
+                    <button disabled={Boolean(checkoutBusy)} onClick={() => startCheckout("fivepack")} className="w-full rounded-xl p-4 text-left border transition-all active:scale-[.99] disabled:opacity-40" style={{ borderColor: P.gold, background: P.night }}>
+                      <p className="font-bold text-sm" style={{ color: P.parchment }}>Five readings <span className="float-right" style={{ color: P.gold }}>$7.97</span></p>
+                      <p className="text-xs mt-0.5" style={{ color: P.faint }}>Problems rarely travel alone · save 20%</p>
+                    </button>
+                    <button disabled={Boolean(checkoutBusy)} onClick={() => startCheckout("sub")} className="w-full rounded-xl p-4 text-left transition-all active:scale-[.99] disabled:opacity-40" style={{ background: P.goldSoft, border: `1px solid ${P.gold}` }}>
+                      <p className="font-bold text-sm" style={{ color: P.gold }}>Unlimited + the Daily Card <span className="float-right">$4.99/mo</span></p>
+                      <p className="text-xs mt-0.5" style={{ color: "#C9C7E3" }}>Every problem, plus one card every morning</p>
+                    </button>
+                  </div>
+                  {checkoutError && <p className="text-sm mt-3" style={{ color: P.rose }}>{checkoutError}</p>}
+                </>
+              )}
             </div>
+          </div>
+        )}
+
+        {/* Account — deliberately tiny: the first reading needs no login at all */}
+        {isSupabaseConfigured && (
+          <div className="mt-10 text-center">
+            {authStep === "signin" ? (
+              <form onSubmit={signIn} className="mx-auto w-full max-w-sm rounded-3xl p-5 space-y-4 text-left" style={{ background: P.nightSoft, border: "1px solid #2E3060" }}>
+                <Field label="Email" type="email" required value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="you@example.com" />
+                <Field label="Password" type="password" required value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} placeholder="Your password" />
+                {authError && <p className="text-sm" style={{ color: P.rose }}>{authError}</p>}
+                {authNote && <p className="text-sm" style={{ color: P.lavender }}>{authNote}</p>}
+                <button type="submit" disabled={authBusy} className="w-full rounded-xl py-3 font-bold text-sm transition-all active:scale-[.99] disabled:opacity-40" style={{ background: P.gold, color: P.night }}>
+                  {authBusy ? "One moment…" : "Sign in"}
+                </button>
+                <div className="flex items-center justify-between">
+                  <button type="button" disabled={authBusy} onClick={forgotPassword} className="text-xs font-bold" style={{ color: P.faint }}>Forgot password</button>
+                  <button type="button" onClick={() => { setAuthStep(""); setAuthError(""); setAuthNote(""); }} className="text-xs font-bold" style={{ color: P.faint }}>Close</button>
+                </div>
+              </form>
+            ) : hasEmail ? (
+              <p className="text-[11px]" style={{ color: P.faint }}>
+                {user.email} · <button onClick={signOut} className="font-bold" style={{ color: P.faint }}>sign out</button>
+              </p>
+            ) : (
+              <button onClick={() => { setAuthStep("signin"); setAuthError(""); setAuthNote(""); }} className="text-[11px] font-bold" style={{ color: P.faint }}>
+                Been here before? Sign in
+              </button>
+            )}
           </div>
         )}
 
