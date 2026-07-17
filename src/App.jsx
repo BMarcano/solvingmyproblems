@@ -31,6 +31,14 @@ const FONTS = (
     @keyframes floaty { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
     @keyframes moonGlow { 0%,100% { filter: drop-shadow(0 0 4px rgba(232,196,104,.25)); } 50% { filter: drop-shadow(0 0 11px rgba(232,196,104,.55)); } }
     .floaty { animation: floaty 4s ease-in-out infinite, moonGlow 5s ease-in-out infinite; }
+    /* Sections rise softly into place on load. */
+    @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+    .rise { animation: rise .8s cubic-bezier(.2,.8,.2,1) both; }
+    /* A band of light sweeps the gold CTA every few seconds. */
+    @keyframes sheen { 0%, 74% { transform: translateX(-130%); } 92%, 100% { transform: translateX(130%); } }
+    .cta-sheen { position: absolute; inset: 0; background: linear-gradient(115deg, transparent 42%, rgba(255,255,255,.35) 50%, transparent 58%); transform: translateX(-130%); animation: sheen 5.5s ease-in-out infinite; pointer-events: none; }
+    @keyframes spinSlow { to { transform: rotate(360deg); } }
+    .spin-slow { animation: spinSlow 1.6s linear infinite; }
     /* The sky moves: each layer is doubled vertically and scrolls one full
        height, so the loop is seamless. Twinkle stays per-star. */
     @keyframes starDrift { from { transform: translate3d(0,0,0); } to { transform: translate3d(0,-50%,0); } }
@@ -39,7 +47,7 @@ const FONTS = (
     .shooting-star { width: clamp(48px, 12vw, 110px); height: 2px; border-radius: 999px; background: linear-gradient(90deg, rgba(232,196,104,.9), rgba(232,196,104,0)); opacity: 0; animation: shoot var(--sd, 18s) linear infinite; animation-delay: var(--sdelay, 0s); }
     @keyframes nebulaPulse { 0%,100% { transform: translate3d(0,0,0) scale(1); opacity: .45; } 50% { transform: translate3d(-2%,3%,0) scale(1.07); opacity: .8; } }
     .nebula { opacity: .45; animation: nebulaPulse var(--np, 48s) ease-in-out infinite; }
-    @media (prefers-reduced-motion: reduce) { .deal, .star, .floaty, .star-drift, .shooting-star, .nebula { animation: none; } }
+    @media (prefers-reduced-motion: reduce) { .deal, .star, .floaty, .star-drift, .shooting-star, .nebula, .rise, .cta-sheen, .spin-slow { animation: none; } }
   `}</style>
 );
 
@@ -55,25 +63,32 @@ const P = {
   faint: "#8E8FB8",
 };
 
-// Deterministic star field (no re-randomizing on render)
-const STARS = Array.from({ length: 40 }, (_, i) => ({
-  left: ((i * 37) % 100),
-  top: ((i * 53) % 100),
-  size: (i % 3) + 1,
+// Deterministic star field (no re-randomizing on render). The quadratic terms
+// scatter the positions so the multiples don't draw visible diagonal bands.
+const STARS = Array.from({ length: 96 }, (_, i) => ({
+  left: ((i * 37 + i * i * 3) % 100),
+  top: ((i * 53 + i * i * 7) % 100),
+  size: [1, 1.5, 2.5][i % 3] + (i % 11 === 0 ? 0.5 : 0),
+  bright: i % 11 === 0, // a few stars get a soft halo
   tw: 2.2 + (i % 5) * 0.7,
+  delay: -((i % 13) * 0.7), // negative delays de-sync the twinkling
 }));
 
-// Two parallax layers: far stars crawl, near stars drift a little faster.
+// Three parallax layers: the farthest stars are the smallest and crawl, the
+// nearest are the biggest and drift fastest.
 const STAR_LAYERS = [
-  { speed: "260s", stars: STARS.filter((_, i) => i % 2 === 0) },
-  { speed: "160s", stars: STARS.filter((_, i) => i % 2 === 1) },
+  { speed: "320s", stars: STARS.filter((_, i) => i % 3 === 0) },
+  { speed: "230s", stars: STARS.filter((_, i) => i % 3 === 1) },
+  { speed: "150s", stars: STARS.filter((_, i) => i % 3 === 2) },
 ];
 
-// Occasional shooting stars — long cycles so a streak stays a small event.
+// Occasional shooting stars — staggered cycles so a streak stays an event, not noise.
 const SHOOTING_STARS = [
   { left: 72, top: 4, sd: 14, sdelay: 3 },
   { left: 94, top: 18, sd: 19, sdelay: 9 },
   { left: 48, top: 2, sd: 23, sdelay: 15 },
+  { left: 85, top: 40, sd: 27, sdelay: 6 },
+  { left: 60, top: 12, sd: 31, sdelay: 21 },
 ];
 
 // Slow-breathing nebulas behind everything, in the palette's own hues.
@@ -81,6 +96,7 @@ const NEBULAS = [
   { size: 520, style: { left: "-10%", top: "-6%" }, color: "rgba(184,169,232,.10)", np: "46s" },
   { size: 640, style: { right: "-16%", top: "26%" }, color: "rgba(232,196,104,.06)", np: "58s" },
   { size: 430, style: { left: "16%", bottom: "-10%" }, color: "rgba(232,139,163,.05)", np: "52s" },
+  { size: 380, style: { left: "38%", top: "6%" }, color: "rgba(184,169,232,.07)", np: "64s" },
 ];
 
 async function consultTheTools({ problem, birthdate, birthtime, birthplace, partnerName, partnerBirthdate, token }) {
@@ -157,7 +173,9 @@ function Field({ label, ...props }) {
   const [focused, setFocused] = useState(false);
   const filled = props.value !== undefined && props.value !== null && props.value !== "";
   return (
-    <div>
+    // justify-end anchors label+input to the bottom of the grid cell, so when a
+    // long label wraps to two lines the inputs in that row still line up.
+    <div className="flex flex-col justify-end">
       <Label>{label}</Label>
       <input
         {...props}
@@ -446,7 +464,7 @@ export default function SolvingMyProblems() {
             {[0, 1].map((half) => (
               <div key={half} className="absolute inset-x-0" style={{ top: `${half * 50}%`, height: "50%" }}>
                 {layer.stars.map((s, i) => (
-                  <div key={i} className="star absolute rounded-full" style={{ left: `${s.left}%`, top: `${s.top}%`, width: s.size, height: s.size, background: P.gold, "--tw": `${s.tw}s` }} />
+                  <div key={i} className="star absolute rounded-full" style={{ left: `${s.left}%`, top: `${s.top}%`, width: s.size, height: s.size, background: P.gold, boxShadow: s.bright ? "0 0 6px 1px rgba(232,196,104,.7)" : undefined, animationDelay: `${s.delay}s`, "--tw": `${s.tw}s` }} />
                 ))}
               </div>
             ))}
@@ -459,7 +477,7 @@ export default function SolvingMyProblems() {
 
       <div className="relative max-w-2xl mx-auto px-6 py-12">
         {/* Header */}
-        <header className="text-center">
+        <header className="text-center rise">
           <div className="floaty inline-block"><Moon size={28} style={{ color: P.gold }} /></div>
           <h1 className="smp-display text-5xl font-semibold mt-3" style={{ color: P.parchment }}>
             Solving <em style={{ color: P.gold }}>My</em> Problems
@@ -471,7 +489,7 @@ export default function SolvingMyProblems() {
 
         {/* Input */}
         {!reading && (
-          <section className="mt-10 rounded-3xl p-6 space-y-5" style={{ background: P.nightSoft, border: "1px solid #2E3060" }}>
+          <section className="mt-10 rounded-3xl p-6 space-y-5 rise" style={{ background: P.nightSoft, border: "1px solid #2E3060", animationDelay: ".12s" }}>
             <div>
               <Label>The problem, in your own words</Label>
               <textarea
@@ -514,10 +532,11 @@ export default function SolvingMyProblems() {
             <button
               disabled={!problem.trim() || loading}
               onClick={handleConsult}
-              className="w-full rounded-xl py-4 font-bold text-sm tracking-wide transition-all active:scale-[.99] disabled:opacity-40 flex items-center justify-center gap-2"
+              className="relative overflow-hidden w-full rounded-xl py-4 font-bold text-sm tracking-wide transition-all active:scale-[.99] disabled:opacity-40 flex items-center justify-center gap-2"
               style={{ background: P.gold, color: P.night }}
             >
-              <Sparkles size={16} />
+              <span className="cta-sheen" aria-hidden="true" />
+              <Sparkles size={16} className={loading ? "spin-slow" : ""} />
               {loading ? "Consulting the tools…" : "Consult the tools"}
             </button>
             <p className="text-center text-[11px]" style={{ color: P.faint }}>
@@ -528,7 +547,7 @@ export default function SolvingMyProblems() {
 
         {/* Daily Card — the subscriber ritual */}
         {!reading && (
-          <section className="mt-6 rounded-3xl p-5" style={{ background: P.nightSoft, border: "1px solid #2E3060" }}>
+          <section className="mt-6 rounded-3xl p-5 rise" style={{ background: P.nightSoft, border: "1px solid #2E3060", animationDelay: ".24s" }}>
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Sun size={16} style={{ color: P.gold }} />
