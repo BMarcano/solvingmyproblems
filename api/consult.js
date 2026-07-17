@@ -43,16 +43,17 @@ function subscriptionIsActive(sub) {
 // including the compatibility-mode block and every safety guardrail. Do not edit
 // this copy (never predict death/illness/disaster/legal/financial; frame as
 // reflection; end useful).
-function buildPrompt({ problem, birthdate, birthtime, birthplace, partnerName, partnerBirthdate }) {
+function buildPrompt({ problem, name, birthdate, birthtime, birthplace, partnerName, partnerBirthdate }) {
   return `You are the reading engine for "Solving My Problems" — a tasteful, fun divination app. A person brings a real problem; five classic tools each offer a lens. Be warm, a little witty, never doom-y. Every reading must end up genuinely useful — the mysticism is the doorway, practical clarity is the destination. Never predict death, illness, disaster, or legal/financial outcomes. Frame everything as reflection.
 
 The person's problem: "${problem}"
+The person's name: ${name || "not given"}
 Birthdate: ${birthdate || "not given"}
 Birth time: ${birthtime || "not given"}
 Birthplace: ${birthplace || "not given"}
 ${partnerBirthdate ? `COMPATIBILITY MODE: this reading is about the connection between the person and ${partnerName || "someone else"} (their birthdate: ${partnerBirthdate}). Read the DYNAMIC between the two people as it bears on this problem — the tarot card describes the relationship, numerology compares both life paths, astrology is a synastry note between the two charts.` : ""}
 
-Derive the numerology life path from the birthdate if given (in compatibility mode, derive and compare BOTH life paths). Pick ONE tarot card (any of the 78, upright or reversed) that fits the problem. Cast ONE I Ching hexagram (give its number 1-64, name, and unicode hexagram symbol from ䷀-䷿). Give one astrology note (sun sign from birthdate if available, otherwise a general transit-flavored note). The 8-ball gives one of its classic 20 answers. Then synthesize.
+Derive the numerology life path from the birthdate if given (in compatibility mode, derive and compare BOTH life paths). Pick ONE tarot card (any of the 78, upright or reversed) that fits the problem. Cast ONE I Ching hexagram (give its number 1-64, name, and unicode hexagram symbol from ䷀-䷿). Give one astrology note (sun sign from birthdate if available, otherwise a general transit-flavored note). The 8-ball gives one of its classic 20 answers. Then synthesize. Speak to the person directly as "you" — if their name is given, use it naturally; never label them "Person".
 
 Respond ONLY with valid JSON, no markdown fences:
 {
@@ -185,6 +186,7 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "problem_too_long" });
   }
 
+  const name = typeof body.name === "string" ? body.name.trim().slice(0, 60) : "";
   const birthdate = body.birthdate || "";
   const birthtime = body.birthtime || "";
   const birthplace = body.birthplace || "";
@@ -201,7 +203,7 @@ export default async function handler(req, res) {
     spentCredit = gate.spentCredit;
   }
 
-  const prompt = buildPrompt({ problem, birthdate, birthtime, birthplace, partnerName, partnerBirthdate });
+  const prompt = buildPrompt({ problem, name, birthdate, birthtime, birthplace, partnerName, partnerBirthdate });
 
   // Generate; on a parse/HTTP failure retry once, then 502.
   let reading;

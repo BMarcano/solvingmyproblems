@@ -155,7 +155,7 @@ const NEBULAS = [
   { size: 380, style: { left: "38%", top: "6%" }, color: "rgba(184,169,232,.07)", np: "64s" },
 ];
 
-async function consultTheTools({ problem, birthdate, birthtime, birthplace, partnerName, partnerBirthdate, token }) {
+async function consultTheTools({ problem, name, birthdate, birthtime, birthplace, partnerName, partnerBirthdate, token }) {
   // The reading engine (the Anthropic call plus the prompt and its safety
   // guardrails) runs server-side in /api/consult, so the API key never reaches
   // the browser and every reading-consumption decision stays on the server.
@@ -167,6 +167,7 @@ async function consultTheTools({ problem, birthdate, birthtime, birthplace, part
     },
     body: JSON.stringify({
       problem,
+      name,
       birthdate,
       birthtime,
       birthplace,
@@ -244,6 +245,18 @@ function Field({ label, ...props }) {
   );
 }
 
+// Hairline divider with a small caption — separates "About you" from "About
+// them" in compatibility mode.
+function GroupDivider({ children }) {
+  return (
+    <div className="flex items-center gap-3 pt-1">
+      <div className="h-px flex-1" style={{ background: "#2E3060" }} />
+      <p className="smp-mono text-[9px] tracking-[.3em] uppercase" style={{ color: P.faint }}>{children}</p>
+      <div className="h-px flex-1" style={{ background: "#2E3060" }} />
+    </div>
+  );
+}
+
 function ToolCard({ icon: Icon, tool, title, tilt, delay, children }) {
   return (
     <div
@@ -280,6 +293,7 @@ export default function SolvingMyProblems() {
   const [shareOpen, setShareOpen] = useState(false);
   // --- Compatibility mode ---
   const [mode, setMode] = useState("solo"); // solo | duo
+  const [yourName, setYourName] = useState("");
   const [partnerName, setPartnerName] = useState("");
   const [partnerBirthdate, setPartnerBirthdate] = useState("");
   // --- Daily Card (subscriber ritual) ---
@@ -412,6 +426,7 @@ export default function SolvingMyProblems() {
     try {
       const r = await consultTheTools({
         problem, birthdate, birthtime, birthplace,
+        name: mode === "duo" ? yourName : "",
         partnerName: mode === "duo" ? partnerName : "",
         partnerBirthdate: mode === "duo" ? partnerBirthdate : "",
         token: await getAccessToken(),
@@ -624,17 +639,28 @@ export default function SolvingMyProblems() {
                 ))}
               </div>
             </div>
+            {/* Duo mode groups the form: YOUR details first, THEIRS below —
+                so nobody types the other person's info into their own fields. */}
             {mode === "duo" && (
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <Field label="Their name · optional" placeholder="First name" value={partnerName} onChange={(e) => setPartnerName(e.target.value)} />
-                <Field label="Their birthdate" type="date" value={partnerBirthdate} onChange={(e) => setPartnerBirthdate(e.target.value)} />
-              </div>
+              <>
+                <GroupDivider>About you</GroupDivider>
+                <Field label="Your name · optional" placeholder="First name or nickname" value={yourName} onChange={(e) => setYourName(e.target.value)} />
+              </>
             )}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <Field label="Birthdate" type="date" value={birthdate} onChange={(e) => setBirthdate(e.target.value)} />
               <Field label="Birth time · optional" type="time" value={birthtime} onChange={(e) => setBirthtime(e.target.value)} />
               <Field label="Birthplace · optional" placeholder="City" value={birthplace} onChange={(e) => setBirthplace(e.target.value)} />
             </div>
+            {mode === "duo" && (
+              <>
+                <GroupDivider>About them</GroupDivider>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <Field label="Their name · optional" placeholder="First name" value={partnerName} onChange={(e) => setPartnerName(e.target.value)} />
+                  <Field label="Their birthdate" type="date" value={partnerBirthdate} onChange={(e) => setPartnerBirthdate(e.target.value)} />
+                </div>
+              </>
+            )}
             {error && <p className="text-sm" style={{ color: P.rose }}>{error}</p>}
             <button
               disabled={!problem.trim() || loading}
