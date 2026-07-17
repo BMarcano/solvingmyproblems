@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Sparkles, Moon, Hash, Compass, CircleDot, ScrollText, RefreshCw, Share2, Heart, X, Lock, Sun } from "lucide-react";
 import { supabase, isSupabaseConfigured } from "./supabaseClient";
 
@@ -37,8 +37,23 @@ const FONTS = (
     /* A band of light sweeps the gold CTA every few seconds. */
     @keyframes sheen { 0%, 74% { transform: translateX(-130%); } 92%, 100% { transform: translateX(130%); } }
     .cta-sheen { position: absolute; inset: 0; background: linear-gradient(115deg, transparent 42%, rgba(255,255,255,.35) 50%, transparent 58%); transform: translateX(-130%); animation: sheen 5.5s ease-in-out infinite; pointer-events: none; }
+    button:disabled .cta-sheen { animation: none; }
     @keyframes spinSlow { to { transform: rotate(360deg); } }
     .spin-slow { animation: spinSlow 1.6s linear infinite; }
+    /* Sky layers ease toward the cursor (JS sets the transform; the transition
+       gives it the smooth trailing feel). */
+    .parallax-layer { transition: transform .6s cubic-bezier(.22,1,.36,1); will-change: transform; }
+    /* Constellations breathe very faintly among the stars. */
+    @keyframes constellationPulse { 0%,100% { opacity: .1; } 50% { opacity: .32; } }
+    .constellation { opacity: .14; animation: constellationPulse var(--cd, 11s) ease-in-out infinite; }
+    /* Reading cards lift toward you on hover. !important beats the deal
+       animation's fill-mode transform and the inline resting shadow. */
+    .tool-card { transform: rotate(var(--tilt, 0deg)); transition: transform .35s cubic-bezier(.2,.8,.2,1), box-shadow .35s ease; }
+    .tool-card:hover { transform: translateY(-4px) rotate(var(--tilt, 0deg)) scale(1.015) !important; box-shadow: 0 18px 50px rgba(0,0,0,.45), 0 0 24px rgba(232,196,104,.14) !important; }
+    /* A soft light passes through the gold word in the title. Edge stops match
+       so the repeating tile is seamless at any background-position. */
+    @keyframes goldShimmer { 0% { background-position: 0 0; } 100% { background-position: 200% 0; } }
+    .gold-shimmer { background: linear-gradient(100deg, #E8C468 40%, #FFF3CF 50%, #E8C468 60%); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; animation: goldShimmer 7s linear infinite; }
     /* The sky moves: each layer is doubled vertically and scrolls one full
        height, so the loop is seamless. Twinkle stays per-star. */
     @keyframes starDrift { from { transform: translate3d(0,0,0); } to { transform: translate3d(0,-50%,0); } }
@@ -47,7 +62,7 @@ const FONTS = (
     .shooting-star { width: clamp(48px, 12vw, 110px); height: 2px; border-radius: 999px; background: linear-gradient(90deg, rgba(232,196,104,.9), rgba(232,196,104,0)); opacity: 0; animation: shoot var(--sd, 18s) linear infinite; animation-delay: var(--sdelay, 0s); }
     @keyframes nebulaPulse { 0%,100% { transform: translate3d(0,0,0) scale(1); opacity: .45; } 50% { transform: translate3d(-2%,3%,0) scale(1.07); opacity: .8; } }
     .nebula { opacity: .45; animation: nebulaPulse var(--np, 48s) ease-in-out infinite; }
-    @media (prefers-reduced-motion: reduce) { .deal, .star, .floaty, .star-drift, .shooting-star, .nebula, .rise, .cta-sheen, .spin-slow { animation: none; } }
+    @media (prefers-reduced-motion: reduce) { .deal, .star, .floaty, .star-drift, .shooting-star, .nebula, .rise, .cta-sheen, .spin-slow, .constellation, .gold-shimmer { animation: none; } .tool-card, .parallax-layer { transition: none; } }
   `}</style>
 );
 
@@ -63,16 +78,50 @@ const P = {
   faint: "#8E8FB8",
 };
 
-// Deterministic star field (no re-randomizing on render). The quadratic terms
-// scatter the positions so the multiples don't draw visible diagonal bands.
-const STARS = Array.from({ length: 96 }, (_, i) => ({
-  left: ((i * 37 + i * i * 3) % 100),
-  top: ((i * 53 + i * i * 7) % 100),
-  size: [1, 1.5, 2.5][i % 3] + (i % 11 === 0 ? 0.5 : 0),
-  bright: i % 11 === 0, // a few stars get a soft halo
-  tw: 2.2 + (i % 5) * 0.7,
-  delay: -((i % 13) * 0.7), // negative delays de-sync the twinkling
-}));
+// Deterministic star field: a fixed-seed PRNG (stable across every render and
+// reload) plus best-candidate sampling — each star takes the most isolated of
+// 10 candidate spots, so the sky scatters organically with no bands, no lines,
+// and no accidental overlaps.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const STARS = (() => {
+  const rand = mulberry32(0x5eed);
+  const pts = [];
+  for (let i = 0; i < 110; i++) {
+    let best = null;
+    let bestD = -1;
+    for (let c = 0, tries = i === 0 ? 1 : 10; c < tries; c++) {
+      const cand = [rand() * 100, rand() * 100];
+      let d = Infinity;
+      for (const p of pts) {
+        // toroidal distance: the field tiles vertically for the drift loop
+        const dx = Math.min(Math.abs(cand[0] - p[0]), 100 - Math.abs(cand[0] - p[0]));
+        const dy = Math.min(Math.abs(cand[1] - p[1]), 100 - Math.abs(cand[1] - p[1]));
+        d = Math.min(d, dx * dx + dy * dy);
+      }
+      if (d > bestD) { bestD = d; best = cand; }
+    }
+    pts.push(best);
+  }
+  return pts.map(([left, top], i) => ({
+    left: +left.toFixed(2),
+    // compressed into [0.3, 99.3] so no star straddles the drift-loop seam
+    top: +(0.3 + top * 0.99).toFixed(2),
+    size: [1, 1.5, 2.5][i % 3] + (i % 11 === 0 ? 0.5 : 0),
+    bright: i % 11 === 0, // a few stars get a soft halo
+    tw: +(2.2 + rand() * 2.8).toFixed(2),
+    delay: -+(rand() * 8).toFixed(2), // negative delays de-sync the twinkling
+  }));
+})();
 
 // Three parallax layers: the farthest stars are the smallest and crawl, the
 // nearest are the biggest and drift fastest.
@@ -80,6 +129,13 @@ const STAR_LAYERS = [
   { speed: "320s", stars: STARS.filter((_, i) => i % 3 === 0) },
   { speed: "230s", stars: STARS.filter((_, i) => i % 3 === 1) },
   { speed: "150s", stars: STARS.filter((_, i) => i % 3 === 2) },
+];
+
+// Faint constellations traced among the mid-layer stars; they drift with them.
+const CONSTELLATIONS = [
+  { left: 8, top: 12, w: 120, h: 60, cd: "9s", pts: [[4, 44], [22, 32], [40, 26], [58, 24], [74, 30], [92, 26], [114, 12]] },
+  { left: 66, top: 40, w: 90, h: 34, cd: "12s", pts: [[2, 26], [20, 4], [42, 20], [64, 2], [86, 16]] },
+  { left: 30, top: 72, w: 60, h: 64, cd: "10s", pts: [[30, 2], [54, 26], [30, 60], [6, 26], [30, 2]] },
 ];
 
 // Occasional shooting stars — staggered cycles so a streak stays an event, not noise.
@@ -191,7 +247,7 @@ function Field({ label, ...props }) {
 function ToolCard({ icon: Icon, tool, title, tilt, delay, children }) {
   return (
     <div
-      className="deal rounded-2xl p-5 relative"
+      className="deal tool-card rounded-2xl p-5 relative"
       style={{ background: P.card, border: "1px solid #2E3060", "--tilt": tilt, animationDelay: delay, boxShadow: "0 12px 40px rgba(0,0,0,.35)" }}
     >
       <div className="flex items-center gap-2.5">
@@ -242,6 +298,42 @@ export default function SolvingMyProblems() {
   const [authNote, setAuthNote] = useState("");
 
   const hasEmail = Boolean(user && !user.is_anonymous && user.email);
+
+  const skyRef = useRef(null);
+
+  // The sky leans a few pixels toward the cursor, each layer by a different
+  // depth. Direct DOM writes (no React re-render per mouse move), rAF-throttled,
+  // skipped on touch devices and under prefers-reduced-motion; the CSS
+  // transition on .parallax-layer supplies the smooth trailing feel.
+  useEffect(() => {
+    const sky = skyRef.current;
+    if (!sky) return undefined;
+    if (!window.matchMedia("(hover: hover)").matches) return undefined;
+    const reduceMq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    if (reduceMq.matches) return undefined;
+    const layers = sky.querySelectorAll("[data-parallax]");
+    let raf = 0;
+    let mx = 0;
+    let my = 0;
+    const apply = () => {
+      raf = 0;
+      layers.forEach((el) => {
+        const depth = Number(el.dataset.parallax) || 0;
+        el.style.transform = `translate3d(${(-mx * depth).toFixed(1)}px, ${(-my * depth).toFixed(1)}px, 0)`;
+      });
+    };
+    const onMove = (e) => {
+      if (reduceMq.matches) return; // honors an OS toggle made mid-session
+      mx = e.clientX / window.innerWidth - 0.5;
+      my = e.clientY / window.innerHeight - 0.5;
+      if (!raf) raf = requestAnimationFrame(apply);
+    };
+    window.addEventListener("mousemove", onMove);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, []);
 
   // Boot: anonymous-first. The free reading needs no login, and because the
   // anonymous user is a real auth.users row, the profiles trigger, RLS and the
@@ -454,25 +546,40 @@ export default function SolvingMyProblems() {
   return (
     <div className="smp-root min-h-screen w-full relative overflow-hidden" style={{ background: P.night }}>
       {FONTS}
-      {/* the sky — breathing nebulas, two drifting star layers, shooting stars */}
-      <div className="absolute inset-0 overflow-hidden pointer-events-none">
-        {NEBULAS.map((n, i) => (
-          <div key={i} className="nebula absolute rounded-full" style={{ width: n.size, height: n.size, background: `radial-gradient(circle, ${n.color}, transparent 65%)`, "--np": n.np, ...n.style }} />
-        ))}
+      {/* the sky — nebulas, three drifting star layers with constellations,
+          shooting stars; the whole thing leans gently toward the cursor */}
+      <div ref={skyRef} className="absolute inset-0 overflow-hidden pointer-events-none">
+        <div data-parallax="6" className="parallax-layer absolute inset-0">
+          {NEBULAS.map((n, i) => (
+            <div key={i} className="nebula absolute rounded-full" style={{ width: n.size, height: n.size, background: `radial-gradient(circle, ${n.color}, transparent 65%)`, "--np": n.np, ...n.style }} />
+          ))}
+        </div>
         {STAR_LAYERS.map((layer, l) => (
-          <div key={l} className="star-drift absolute inset-x-0 top-0" style={{ height: "200%", "--speed": layer.speed }}>
-            {[0, 1].map((half) => (
-              <div key={half} className="absolute inset-x-0" style={{ top: `${half * 50}%`, height: "50%" }}>
-                {layer.stars.map((s, i) => (
-                  <div key={i} className="star absolute rounded-full" style={{ left: `${s.left}%`, top: `${s.top}%`, width: s.size, height: s.size, background: P.gold, boxShadow: s.bright ? "0 0 6px 1px rgba(232,196,104,.7)" : undefined, animationDelay: `${s.delay}s`, "--tw": `${s.tw}s` }} />
-                ))}
-              </div>
-            ))}
+          <div key={l} data-parallax={[10, 18, 30][l]} className="parallax-layer absolute inset-0">
+            <div className="star-drift absolute inset-x-0 top-0" style={{ height: "200%", "--speed": layer.speed }}>
+              {[0, 1].map((half) => (
+                <div key={half} className="absolute inset-x-0" style={{ top: `${half * 50}%`, height: "50%" }}>
+                  {l === 1 && CONSTELLATIONS.map((c, ci) => (
+                    <svg key={`c${ci}`} className="constellation absolute" style={{ left: `${c.left}%`, top: `${c.top}%`, "--cd": c.cd }} width={c.w} height={c.h} viewBox={`0 0 ${c.w} ${c.h}`} fill="none" aria-hidden="true">
+                      <polyline points={c.pts.map((p) => p.join(",")).join(" ")} stroke={P.gold} strokeOpacity=".45" strokeWidth=".8" />
+                      {c.pts.map(([x, y], pi) => (
+                        <circle key={pi} cx={x} cy={y} r="1.5" fill={P.gold} />
+                      ))}
+                    </svg>
+                  ))}
+                  {layer.stars.map((s, i) => (
+                    <div key={i} className="star absolute rounded-full" style={{ left: `${s.left}%`, top: `${s.top}%`, width: s.size, height: s.size, background: P.gold, boxShadow: s.bright ? "0 0 6px 1px rgba(232,196,104,.7)" : undefined, animationDelay: `${s.delay}s`, "--tw": `${s.tw}s` }} />
+                  ))}
+                </div>
+              ))}
+            </div>
           </div>
         ))}
-        {SHOOTING_STARS.map((s, i) => (
-          <div key={i} className="shooting-star absolute" style={{ left: `${s.left}%`, top: `${s.top}%`, "--sd": `${s.sd}s`, "--sdelay": `${s.sdelay}s` }} />
-        ))}
+        <div data-parallax="24" className="parallax-layer absolute inset-0">
+          {SHOOTING_STARS.map((s, i) => (
+            <div key={i} className="shooting-star absolute" style={{ left: `${s.left}%`, top: `${s.top}%`, "--sd": `${s.sd}s`, "--sdelay": `${s.sdelay}s` }} />
+          ))}
+        </div>
       </div>
 
       <div className="relative max-w-2xl mx-auto px-6 py-12">
@@ -480,7 +587,7 @@ export default function SolvingMyProblems() {
         <header className="text-center rise">
           <div className="floaty inline-block"><Moon size={28} style={{ color: P.gold }} /></div>
           <h1 className="smp-display text-5xl font-semibold mt-3" style={{ color: P.parchment }}>
-            Solving <em style={{ color: P.gold }}>My</em> Problems
+            Solving <em className="gold-shimmer" style={{ color: P.gold }}>My</em> Problems
           </h1>
           <p className="text-sm mt-3 max-w-md mx-auto leading-relaxed" style={{ color: P.faint }}>
             Bring the tools of five ancient advisors to one modern problem. Tarot, the I Ching, numerology, the stars — and, for tie-breaks, the 8-ball.
