@@ -14,16 +14,32 @@ import { supabase, isSupabaseConfigured } from "./supabaseClient";
 const FONTS = (
   <style>{`
     @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;0,700;1,500&family=Karla:wght@400;500;700&family=Space+Mono:wght@400;700&display=swap');
-    .smp-root { font-family: 'Karla', sans-serif; }
+    :root { color-scheme: dark; background: #12132B; }
+    .smp-root { font-family: 'Karla', sans-serif; color-scheme: dark; }
     .smp-display { font-family: 'Cormorant Garamond', serif; }
     .smp-mono { font-family: 'Space Mono', monospace; }
+    /* Native date/time widgets render at their own heights — pin every Field to
+       one height so the birthdate / birth time / birthplace row lines up. */
+    .smp-field { height: 46px; -webkit-appearance: none; appearance: none; }
+    .smp-field::placeholder { color: #8E8FB8; opacity: 1; }
+    .smp-field::-webkit-calendar-picker-indicator { opacity: .55; cursor: pointer; }
+    .smp-field::-webkit-date-and-time-value { text-align: left; }
     @keyframes dealIn { from { opacity: 0; transform: translateY(24px) rotate(var(--tilt, 0deg)) scale(.96); } to { opacity: 1; transform: translateY(0) rotate(var(--tilt, 0deg)) scale(1); } }
     .deal { animation: dealIn .7s cubic-bezier(.2,.8,.2,1) both; }
     @keyframes twinkle { 0%,100% { opacity: .25; } 50% { opacity: .9; } }
     .star { animation: twinkle var(--tw, 3s) ease-in-out infinite; }
     @keyframes floaty { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
-    .floaty { animation: floaty 4s ease-in-out infinite; }
-    @media (prefers-reduced-motion: reduce) { .deal, .star, .floaty { animation: none; } }
+    @keyframes moonGlow { 0%,100% { filter: drop-shadow(0 0 4px rgba(232,196,104,.25)); } 50% { filter: drop-shadow(0 0 11px rgba(232,196,104,.55)); } }
+    .floaty { animation: floaty 4s ease-in-out infinite, moonGlow 5s ease-in-out infinite; }
+    /* The sky moves: each layer is doubled vertically and scrolls one full
+       height, so the loop is seamless. Twinkle stays per-star. */
+    @keyframes starDrift { from { transform: translate3d(0,0,0); } to { transform: translate3d(0,-50%,0); } }
+    .star-drift { animation: starDrift var(--speed, 180s) linear infinite; }
+    @keyframes shoot { 0% { transform: translate3d(0,0,0) rotate(330deg); opacity: 0; } 2% { opacity: .9; } 9% { transform: translate3d(-46vw, 26vw, 0) rotate(330deg); opacity: 0; } 100% { transform: translate3d(-46vw, 26vw, 0) rotate(330deg); opacity: 0; } }
+    .shooting-star { width: clamp(48px, 12vw, 110px); height: 2px; border-radius: 999px; background: linear-gradient(90deg, rgba(232,196,104,.9), rgba(232,196,104,0)); opacity: 0; animation: shoot var(--sd, 18s) linear infinite; animation-delay: var(--sdelay, 0s); }
+    @keyframes nebulaPulse { 0%,100% { transform: translate3d(0,0,0) scale(1); opacity: .45; } 50% { transform: translate3d(-2%,3%,0) scale(1.07); opacity: .8; } }
+    .nebula { opacity: .45; animation: nebulaPulse var(--np, 48s) ease-in-out infinite; }
+    @media (prefers-reduced-motion: reduce) { .deal, .star, .floaty, .star-drift, .shooting-star, .nebula { animation: none; } }
   `}</style>
 );
 
@@ -46,6 +62,26 @@ const STARS = Array.from({ length: 40 }, (_, i) => ({
   size: (i % 3) + 1,
   tw: 2.2 + (i % 5) * 0.7,
 }));
+
+// Two parallax layers: far stars crawl, near stars drift a little faster.
+const STAR_LAYERS = [
+  { speed: "260s", stars: STARS.filter((_, i) => i % 2 === 0) },
+  { speed: "160s", stars: STARS.filter((_, i) => i % 2 === 1) },
+];
+
+// Occasional shooting stars — long cycles so a streak stays a small event.
+const SHOOTING_STARS = [
+  { left: 72, top: 4, sd: 14, sdelay: 3 },
+  { left: 94, top: 18, sd: 19, sdelay: 9 },
+  { left: 48, top: 2, sd: 23, sdelay: 15 },
+];
+
+// Slow-breathing nebulas behind everything, in the palette's own hues.
+const NEBULAS = [
+  { size: 520, style: { left: "-10%", top: "-6%" }, color: "rgba(184,169,232,.10)", np: "46s" },
+  { size: 640, style: { right: "-16%", top: "26%" }, color: "rgba(232,196,104,.06)", np: "58s" },
+  { size: 430, style: { left: "16%", bottom: "-10%" }, color: "rgba(232,139,163,.05)", np: "52s" },
+];
 
 async function consultTheTools({ problem, birthdate, birthtime, birthplace, partnerName, partnerBirthdate, token }) {
   // The reading engine (the Anthropic call plus the prompt and its safety
@@ -114,13 +150,21 @@ function Label({ children }) {
 }
 
 function Field({ label, ...props }) {
+  // Empty date/time inputs show their own dd/mm/aaaa · --:-- hint text; tint it
+  // like a placeholder until there is a real value. Focus also lifts the tint:
+  // date inputs report value "" until a COMPLETE date is typed, and without
+  // this the segments the user is mid-typing would render as ghost text.
+  const [focused, setFocused] = useState(false);
+  const filled = props.value !== undefined && props.value !== null && props.value !== "";
   return (
     <div>
       <Label>{label}</Label>
       <input
         {...props}
-        className="w-full rounded-lg px-4 py-3 text-sm outline-none border transition-colors focus:border-current"
-        style={{ background: P.nightSoft, borderColor: "#2E3060", color: P.parchment }}
+        onFocus={(e) => { setFocused(true); props.onFocus?.(e); }}
+        onBlur={(e) => { setFocused(false); props.onBlur?.(e); }}
+        className="smp-field w-full rounded-lg px-4 text-sm outline-none border transition-colors focus:border-current"
+        style={{ background: P.nightSoft, borderColor: "#2E3060", color: filled || focused ? P.parchment : P.faint }}
       />
     </div>
   );
@@ -392,10 +436,24 @@ export default function SolvingMyProblems() {
   return (
     <div className="smp-root min-h-screen w-full relative overflow-hidden" style={{ background: P.night }}>
       {FONTS}
-      {/* star field */}
-      <div className="absolute inset-0 pointer-events-none">
-        {STARS.map((s, i) => (
-          <div key={i} className="star absolute rounded-full" style={{ left: `${s.left}%`, top: `${s.top}%`, width: s.size, height: s.size, background: P.gold, "--tw": `${s.tw}s` }} />
+      {/* the sky — breathing nebulas, two drifting star layers, shooting stars */}
+      <div className="absolute inset-0 overflow-hidden pointer-events-none">
+        {NEBULAS.map((n, i) => (
+          <div key={i} className="nebula absolute rounded-full" style={{ width: n.size, height: n.size, background: `radial-gradient(circle, ${n.color}, transparent 65%)`, "--np": n.np, ...n.style }} />
+        ))}
+        {STAR_LAYERS.map((layer, l) => (
+          <div key={l} className="star-drift absolute inset-x-0 top-0" style={{ height: "200%", "--speed": layer.speed }}>
+            {[0, 1].map((half) => (
+              <div key={half} className="absolute inset-x-0" style={{ top: `${half * 50}%`, height: "50%" }}>
+                {layer.stars.map((s, i) => (
+                  <div key={i} className="star absolute rounded-full" style={{ left: `${s.left}%`, top: `${s.top}%`, width: s.size, height: s.size, background: P.gold, "--tw": `${s.tw}s` }} />
+                ))}
+              </div>
+            ))}
+          </div>
+        ))}
+        {SHOOTING_STARS.map((s, i) => (
+          <div key={i} className="shooting-star absolute" style={{ left: `${s.left}%`, top: `${s.top}%`, "--sd": `${s.sd}s`, "--sdelay": `${s.sdelay}s` }} />
         ))}
       </div>
 
