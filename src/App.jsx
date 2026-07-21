@@ -245,6 +245,22 @@ function Field({ label, ...props }) {
   );
 }
 
+// The brand mark — a circled crescent with a diamond accent, drawn inline so it
+// stays crisp at any size and keeps the site's own gold.
+function BrandMark({ size = 44 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 64 64" fill="none" aria-hidden="true">
+      <circle cx="32" cy="32" r="30" stroke={P.gold} strokeWidth="2.5" />
+      <mask id="smp-moon-mask">
+        <rect width="64" height="64" fill="white" />
+        <circle cx="35" cy="27" r="11" fill="black" />
+      </mask>
+      <circle cx="28" cy="34" r="13" fill={P.gold} mask="url(#smp-moon-mask)" />
+      <rect x="38.5" y="18.5" width="6.5" height="6.5" transform="rotate(45 41.75 21.75)" fill={P.gold} />
+    </svg>
+  );
+}
+
 // Hairline divider with a small caption — separates "About you" from "About
 // them" in compatibility mode.
 function GroupDivider({ children }) {
@@ -600,7 +616,7 @@ export default function SolvingMyProblems() {
       <div className="relative max-w-2xl mx-auto px-6 py-12">
         {/* Header */}
         <header className="text-center rise">
-          <div className="floaty inline-block"><Moon size={28} style={{ color: P.gold }} /></div>
+          <div className="floaty inline-block"><BrandMark size={44} /></div>
           <h1 className="smp-display text-5xl font-semibold mt-3" style={{ color: P.parchment }}>
             Solving <em className="gold-shimmer" style={{ color: P.gold }}>My</em> Problems
           </h1>
