@@ -1,0 +1,22 @@
+<!-- Supabase → Authentication → Emails → Templates → "Change Email Address"
+     Suggested subject: Confirm your new address · Solving My Problems
+     This is the one an anonymous account receives when attaching an email at
+     the paywall (if secure email change / confirmations are enabled). -->
+<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#12132B;padding:40px 16px;">
+  <tr><td align="center">
+    <table width="520" cellpadding="0" cellspacing="0" border="0" style="max-width:520px;width:100%;background-color:#1C1E3F;border:1px solid #2E3060;border-radius:16px;">
+      <tr><td style="padding:40px 36px;text-align:center;font-family:Arial,Helvetica,sans-serif;">
+        <img src="https://www.solvingmyproblems.com/brand-mark.png" width="72" height="72" alt="Solving My Problems" style="display:block;margin:0 auto 20px;border-radius:16px;" />
+        <h1 style="margin:0 0 14px;font-family:Georgia,'Times New Roman',serif;font-size:26px;font-weight:600;color:#F4EFE4;">A new address for your readings</h1>
+        <p style="margin:0 0 26px;font-size:14px;line-height:1.7;color:#C9C7E3;">Confirm below to attach this email to your account. Your free reading and anything you've unlocked come along with you.</p>
+        <table cellpadding="0" cellspacing="0" border="0" align="center"><tr>
+          <td style="background-color:#E8C468;border-radius:10px;">
+            <a href="{{ .ConfirmationURL }}" style="display:inline-block;padding:13px 30px;font-family:Arial,Helvetica,sans-serif;font-size:14px;font-weight:bold;color:#12132B;text-decoration:none;">Confirm this address</a>
+          </td>
+        </tr></table>
+        <p style="margin:26px 0 0;font-size:11px;line-height:1.6;color:#8E8FB8;">If you didn't request this, you can safely ignore it.</p>
+      </td></tr>
+    </table>
+    <p style="margin:18px 0 0;font-family:Arial,Helvetica,sans-serif;font-size:10px;line-height:1.6;color:#5B5C86;text-align:center;">solvingmyproblems.com &middot; readings are for reflection &amp; entertainment, not professional advice.</p>
+  </td></tr>
+</table>

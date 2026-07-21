@@ -330,6 +330,24 @@ export default function SolvingMyProblems() {
   const hasEmail = Boolean(user && !user.is_anonymous && user.email);
 
   const skyRef = useRef(null);
+  const welcomeRequestedRef = useRef(false);
+
+  // One warm welcome email when the account becomes a real one (email attached).
+  // Fire-and-forget; the server is idempotent, so repeat sessions are no-ops.
+  useEffect(() => {
+    if (!user || user.is_anonymous || !user.email) return;
+    if (user.user_metadata?.smp_welcomed) return;
+    if (welcomeRequestedRef.current) return;
+    welcomeRequestedRef.current = true;
+    (async () => {
+      const token = await getAccessToken();
+      if (!token) return;
+      fetch("/api/welcome", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      }).catch(() => {});
+    })();
+  }, [user]);
 
   // The sky leans a few pixels toward the cursor, each layer by a different
   // depth. Direct DOM writes (no React re-render per mouse move), rAF-throttled,

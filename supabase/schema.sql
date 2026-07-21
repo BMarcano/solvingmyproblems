@@ -1,7 +1,7 @@
 -- Solving My Problems — database schema
 --
 -- ⚠️  Run this in the SQL Editor of the *Solving My Problems* Supabase project.
---     Double-check the project before running: several other projects exist, and
+--  itipbocyyrjxsnhzqwpj   Double-check the project before running: several other projects exist, and
 --     the drop policy / drop trigger statements below use generic names
 --     (on_auth_user_created, profiles_select_own, handle_new_user) that other
 --     products very likely also use. Running this in the wrong project would
