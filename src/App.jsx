@@ -187,9 +187,9 @@ async function consultTheTools({ problem, name, birthdate, birthtime, birthplace
 }
 
 // ---------- Daily Card: subscriber ritual — one-card morning pull ----------
-async function pullDailyCard({ token }) {
+async function pullDailyCard({ birthdate, token }) {
   // Subscriber daily pull, generated and cached per day server-side in
-  // /api/daily-card (wired up in a later milestone; gated on an active sub).
+  // /api/daily-card (gated on an active subscription).
   const now = new Date();
   const day = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
   const response = await fetch("/api/daily-card", {
@@ -198,7 +198,7 @@ async function pullDailyCard({ token }) {
       "Content-Type": "application/json",
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
-    body: JSON.stringify({ day }),
+    body: JSON.stringify({ day, birthdate }),
   });
   if (!response.ok) throw new Error(`daily-card failed (${response.status})`);
   return response.json();
@@ -698,7 +698,7 @@ export default function SolvingMyProblems() {
               ) : (
                 <button
                   disabled={dailyLoading}
-                  onClick={async () => { setDailyLoading(true); try { setDaily(await pullDailyCard({ token: await getAccessToken() })); } catch {} setDailyLoading(false); }}
+                  onClick={async () => { setDailyLoading(true); try { setDaily(await pullDailyCard({ birthdate, token: await getAccessToken() })); } catch {} setDailyLoading(false); }}
                   className="mt-3 w-full rounded-xl py-3 text-sm font-bold transition-all active:scale-[.99]"
                   style={{ background: P.goldSoft, color: P.gold, border: `1px solid ${P.gold}55` }}
                 >
