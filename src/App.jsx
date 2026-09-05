@@ -218,6 +218,38 @@ async function getAccessToken() {
   return data?.session?.access_token ?? null;
 }
 
+// The consult form lives in React state, which does not survive the redirect to
+// Stripe Checkout (or a trip to the inbox for an email-confirmation link). Park
+// it in localStorage on the way out, put it back on the way in, and after a
+// successful payment run the reading automatically — the thing they just paid
+// for should arrive without retyping a word.
+const PENDING_CONSULT_KEY = "smp:pending-consult";
+const PENDING_CONSULT_TTL_MS = 2 * 60 * 60 * 1000;
+
+function savePendingConsult(fields) {
+  if (!fields?.problem?.trim()) return;
+  try {
+    localStorage.setItem(PENDING_CONSULT_KEY, JSON.stringify({ ...fields, savedAt: Date.now() }));
+  } catch {
+    // Storage blocked (private mode, etc.): they simply retype, as before.
+  }
+}
+
+// Reads and clears the parked form. Null when there is none or it went stale.
+function takePendingConsult() {
+  try {
+    const raw = localStorage.getItem(PENDING_CONSULT_KEY);
+    localStorage.removeItem(PENDING_CONSULT_KEY);
+    if (!raw) return null;
+    const pending = JSON.parse(raw);
+    if (!pending?.problem?.trim()) return null;
+    if (Date.now() - (pending.savedAt || 0) > PENDING_CONSULT_TTL_MS) return null;
+    return pending;
+  } catch {
+    return null;
+  }
+}
+
 function Label({ children }) {
   return <p className="smp-mono text-[10px] tracking-[.25em] uppercase mb-2" style={{ color: P.gold }}>{children}</p>;
 }
@@ -331,6 +363,37 @@ export default function SolvingMyProblems() {
 
   const skyRef = useRef(null);
   const welcomeRequestedRef = useRef(false);
+  // Set once on mount from ?checkout= and the parked form; consumed by the
+  // post-checkout effect below.
+  const checkoutOutcomeRef = useRef("");
+  const pendingConsultRef = useRef(null);
+
+  // Back from Stripe (or from an email-confirmation link): put the form back
+  // exactly as they left it. After a successful checkout also queue the reading,
+  // so it runs the moment the webhook has landed the credit or subscription.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const checkout = params.get("checkout") || "";
+    if (checkout) {
+      checkoutOutcomeRef.current = checkout;
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+    const pending = takePendingConsult();
+    if (!pending) return;
+    setProblem(pending.problem || "");
+    setBirthdate(pending.birthdate || "");
+    setBirthtime(pending.birthtime || "");
+    setBirthplace(pending.birthplace || "");
+    setMode(pending.mode === "duo" ? "duo" : "solo");
+    setYourName(pending.yourName || "");
+    setPartnerName(pending.partnerName || "");
+    setPartnerBirthdate(pending.partnerBirthdate || "");
+    if (checkout === "success" && isSupabaseConfigured) {
+      pendingConsultRef.current = pending;
+      // The button reads "Consulting the tools…" while the payment settles.
+      setLoading(true);
+    }
+  }, []);
 
   // One warm welcome email when the account becomes a real one (email attached).
   // Fire-and-forget; the server is idempotent, so repeat sessions are no-ops.
@@ -411,11 +474,15 @@ export default function SolvingMyProblems() {
 
   // Real credits / subscription / free-reading counter, straight from the
   // tables (select-own via RLS). The server is what actually decides.
+  // Keyed on the id, not the user object: the auth listener hands back a fresh
+  // object for the same account (token refreshes, INITIAL_SESSION), and that
+  // must not restart the post-checkout delivery below.
+  const userId = user?.id ?? null;
   const refreshProfile = useCallback(async () => {
-    if (!supabase || !user) return null;
+    if (!supabase || !userId) return null;
     const [{ data: profile }, { data: sub }] = await Promise.all([
-      supabase.from("profiles").select("free_readings_used, credits").eq("id", user.id).maybeSingle(),
-      supabase.from("subscriptions").select("status, current_period_end").eq("profile_id", user.id).maybeSingle(),
+      supabase.from("profiles").select("free_readings_used, credits").eq("id", userId).maybeSingle(),
+      supabase.from("subscriptions").select("status, current_period_end").eq("profile_id", userId).maybeSingle(),
     ]);
     const active = subscriptionIsActive(sub);
     if (profile) {
@@ -424,54 +491,84 @@ export default function SolvingMyProblems() {
     }
     setSubscribed(active);
     return { credits: profile?.credits ?? 0, subscribed: active };
-  }, [user]);
+  }, [userId]);
 
   useEffect(() => {
     refreshProfile();
   }, [refreshProfile]);
 
-  // Back from Stripe. The webhook may still be in flight, so poll briefly
-  // instead of showing a stale balance.
+  // Back from a successful Stripe checkout. The webhook may still be in
+  // flight, so poll until the credit or subscription shows up (up to ~30s),
+  // then deliver the reading they paid for. Runs once: the ref is cleared on
+  // entry, and the job is deliberately not cancelled on re-render.
   useEffect(() => {
-    if (!user) return undefined;
-    const params = new URLSearchParams(window.location.search);
-    const checkout = params.get("checkout");
-    if (!checkout) return undefined;
-    window.history.replaceState({}, "", window.location.pathname);
-    if (checkout !== "success") return undefined;
-    let cancelled = false;
+    if (!userId || checkoutOutcomeRef.current !== "success") return;
+    checkoutOutcomeRef.current = "";
+    const pending = pendingConsultRef.current;
+    pendingConsultRef.current = null;
     (async () => {
-      for (let i = 0; i < 6 && !cancelled; i++) {
+      let paid = false;
+      for (let i = 0; i < 20; i++) {
         const state = await refreshProfile();
-        if (state && (state.credits > 0 || state.subscribed)) return;
+        if (state && (state.credits > 0 || state.subscribed)) {
+          paid = true;
+          break;
+        }
         await new Promise((resolve) => setTimeout(resolve, 1500));
       }
+      if (!pending) {
+        setLoading(false);
+        return;
+      }
+      if (paid) {
+        await runConsult(pending);
+        return;
+      }
+      // Paid, but the webhook has not landed yet. Keep the form filled so one
+      // press of the button delivers it once the credit arrives.
+      setLoading(false);
+      setError("Your payment went through, but the tools are still catching up. Give it a moment, then press Consult again — this reading is already paid for.");
     })();
-    return () => {
-      cancelled = true;
-    };
-  }, [user, refreshProfile]);
+  }, [userId, refreshProfile]);
 
-  async function handleConsult() {
+  // Everything the reading needs, as one plain object — what gets parked in
+  // localStorage across the Stripe redirect.
+  function formFields() {
+    return { problem, birthdate, birthtime, birthplace, mode, yourName, partnerName, partnerBirthdate };
+  }
+
+  async function runConsult(fields) {
     // The server decides, in order: subscription, then a credit, then the free
     // reading. A 402 means it is time to pay.
     setLoading(true);
     setError("");
     try {
       const r = await consultTheTools({
-        problem, birthdate, birthtime, birthplace,
-        name: mode === "duo" ? yourName : "",
-        partnerName: mode === "duo" ? partnerName : "",
-        partnerBirthdate: mode === "duo" ? partnerBirthdate : "",
+        problem: fields.problem,
+        birthdate: fields.birthdate,
+        birthtime: fields.birthtime,
+        birthplace: fields.birthplace,
+        name: fields.mode === "duo" ? fields.yourName : "",
+        partnerName: fields.mode === "duo" ? fields.partnerName : "",
+        partnerBirthdate: fields.mode === "duo" ? fields.partnerBirthdate : "",
         token: await getAccessToken(),
       });
       setReading(r);
       await refreshProfile();
     } catch (e) {
-      if (e.code === "payment_required") setShowPaywall(true);
-      else setError("The tools are being temperamental. Give it another try in a moment.");
+      if (e.code === "payment_required") {
+        // Park the form now: the email-confirmation detour can leave the tab.
+        savePendingConsult(fields);
+        setShowPaywall(true);
+      } else {
+        setError("The tools are being temperamental. Give it another try in a moment.");
+      }
     }
     setLoading(false);
+  }
+
+  function handleConsult() {
+    return runConsult(formFields());
   }
 
   async function startCheckout(sku) {
@@ -497,6 +594,7 @@ export default function SolvingMyProblems() {
       }
       if (!response.ok) throw new Error(`checkout failed (${response.status})`);
       const { url } = await response.json();
+      savePendingConsult(formFields());
       window.location.href = url;
     } catch (e) {
       setCheckoutError("Checkout is being temperamental. Give it another try in a moment.");
