@@ -8,13 +8,23 @@
 // GATING_ENABLED on   -> verify the Supabase JWT and gate, in order:
 //                        active subscription -> allow
 //                        else spend_credit()    -> allow
-//                        else use_free_reading() -> allow
+//                        else use_free_reading() -> allow, but only once the
+//                             account has an email (428 email_required otherwise:
+//                             the client asks for one and retries)
 //                        else 402 payment_required (client opens the paywall).
 
 import { createClient } from "@supabase/supabase-js";
 
 const GATING_ENABLED = process.env.GATING_ENABLED === "true";
 const PROBLEM_MAX = 600;
+// Good enough to keep junk out of the outreach list; the real check is that
+// the address can receive the welcome/recovery mail later.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+function normalizeEmail(value) {
+  const email = typeof value === "string" ? value.trim().toLowerCase().slice(0, 254) : "";
+  return EMAIL_RE.test(email) ? email : "";
+}
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
 const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -93,8 +103,10 @@ async function generateReading(prompt) {
 }
 
 // Returns { userId, spentCredit } when the reading is allowed, or null after it
-// has already responded (402/401/500).
-async function runGate(req, res) {
+// has already responded (401/402/428/500). `email` is the address the client
+// captured for this reading, if any — stored on the profile here (service
+// role; there is no client write policy on profiles).
+async function runGate(req, res, email) {
   if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
     console.error("consult: GATING_ENABLED is on but Supabase env vars are missing");
     res.status(500).json({ error: "server_misconfigured" });
@@ -115,12 +127,21 @@ async function runGate(req, res) {
   }
   const userId = userData.user.id;
 
-  const { data: sub, error: subError } = await admin()
-    .from("subscriptions")
-    .select("status, current_period_end")
-    .eq("profile_id", userId)
-    .maybeSingle();
+  const [{ data: sub, error: subError }, { data: profile, error: profileError }] = await Promise.all([
+    admin().from("subscriptions").select("status, current_period_end").eq("profile_id", userId).maybeSingle(),
+    admin().from("profiles").select("email").eq("id", userId).maybeSingle(),
+  ]);
   if (subError) console.warn("consult: subscription lookup failed —", subError.message);
+  if (profileError) console.warn("consult: profile lookup failed —", profileError.message);
+
+  // Capture the email whenever one comes in, before any gating: even a reading
+  // that ends in 402 leaves a contact behind.
+  let profileEmail = profile?.email || "";
+  if (email && email !== profileEmail) {
+    const { error: emailError } = await admin().from("profiles").update({ email }).eq("id", userId);
+    if (emailError) console.error("consult: storing email failed —", emailError.message);
+    else profileEmail = email;
+  }
 
   if (subscriptionIsActive(sub)) return { userId, spentCredit: false };
 
@@ -131,6 +152,13 @@ async function runGate(req, res) {
     return null;
   }
   if (spent === true) return { userId, spentCredit: true };
+
+  // The free reading is the lead magnet: no email, no reading. Checked here
+  // rather than in the browser so devtools can't skip it.
+  if (!profileEmail && !userData.user.email) {
+    res.status(428).json({ error: "email_required" });
+    return null;
+  }
 
   const { data: usedFree, error: freeError } = await admin().rpc("use_free_reading", { p_user: userId });
   if (freeError) {
@@ -193,12 +221,13 @@ export default async function handler(req, res) {
   const partnerName = body.partnerName || "";
   const partnerBirthdate = body.partnerBirthdate || "";
   const mode = body.mode === "duo" || partnerBirthdate ? "duo" : "solo";
+  const email = normalizeEmail(body.email);
 
   let userId = null;
   let spentCredit = false;
   if (GATING_ENABLED) {
-    const gate = await runGate(req, res);
-    if (!gate) return; // runGate already responded (401/402/500)
+    const gate = await runGate(req, res, email);
+    if (!gate) return; // runGate already responded (401/402/428/500)
     userId = gate.userId;
     spentCredit = gate.spentCredit;
   }

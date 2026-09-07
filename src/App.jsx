@@ -155,7 +155,7 @@ const NEBULAS = [
   { size: 380, style: { left: "38%", top: "6%" }, color: "rgba(184,169,232,.07)", np: "64s" },
 ];
 
-async function consultTheTools({ problem, name, birthdate, birthtime, birthplace, partnerName, partnerBirthdate, token }) {
+async function consultTheTools({ problem, name, birthdate, birthtime, birthplace, partnerName, partnerBirthdate, email, token }) {
   // The reading engine (the Anthropic call plus the prompt and its safety
   // guardrails) runs server-side in /api/consult, so the API key never reaches
   // the browser and every reading-consumption decision stays on the server.
@@ -174,6 +174,7 @@ async function consultTheTools({ problem, name, birthdate, birthtime, birthplace
       partnerName,
       partnerBirthdate,
       mode: partnerBirthdate ? "duo" : "solo",
+      ...(email ? { email } : {}),
     }),
   });
   // Out of free readings and credits — the caller opens the paywall.
@@ -181,6 +182,12 @@ async function consultTheTools({ problem, name, birthdate, birthtime, birthplace
     const paymentRequired = new Error("payment_required");
     paymentRequired.code = "payment_required";
     throw paymentRequired;
+  }
+  // The free reading needs an email on the account — the caller asks for one.
+  if (response.status === 428) {
+    const emailRequired = new Error("email_required");
+    emailRequired.code = "email_required";
+    throw emailRequired;
   }
   if (!response.ok) throw new Error(`consult failed (${response.status})`);
   return response.json();
@@ -234,6 +241,22 @@ function savePendingConsult(fields) {
     // Storage blocked (private mode, etc.): they simply retype, as before.
   }
 }
+
+// Meta pixel events for the ads (the base PageView fires from index.html).
+// A no-op when the pixel script is blocked or not loaded.
+function trackPixel(event, params) {
+  try {
+    if (typeof window.fbq === "function") window.fbq("track", event, params);
+  } catch {
+    // never let analytics break the app
+  }
+}
+
+// Which plan was chosen, parked across the Stripe redirect so the Purchase
+// event on return carries the right value.
+const CHECKOUT_SKU_KEY = "smp:checkout-sku";
+const SKU_PRICES_USD = { single: 1.99, fivepack: 7.97, sub: 4.99 };
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
 // Reads and clears the parked form. Null when there is none or it went stale.
 function takePendingConsult() {
@@ -358,8 +381,14 @@ export default function SolvingMyProblems() {
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
   const [authNote, setAuthNote] = useState("");
+  // --- Email gate: the free reading asks for an address (no password) ---
+  const [profileEmail, setProfileEmail] = useState("");
+  const [emailStep, setEmailStep] = useState(false);
+  const [emailError, setEmailError] = useState("");
 
   const hasEmail = Boolean(user && !user.is_anonymous && user.email);
+  // Either a real account or a captured address on the anonymous one.
+  const hasCapturedEmail = hasEmail || Boolean(profileEmail);
 
   const skyRef = useRef(null);
   const welcomeRequestedRef = useRef(false);
@@ -377,6 +406,16 @@ export default function SolvingMyProblems() {
     if (checkout) {
       checkoutOutcomeRef.current = checkout;
       window.history.replaceState({}, "", window.location.pathname);
+      let sku = "";
+      try {
+        sku = localStorage.getItem(CHECKOUT_SKU_KEY) || "";
+        localStorage.removeItem(CHECKOUT_SKU_KEY);
+      } catch {
+        // storage blocked: no Purchase value, nothing else changes
+      }
+      if (checkout === "success" && SKU_PRICES_USD[sku]) {
+        trackPixel("Purchase", { value: SKU_PRICES_USD[sku], currency: "USD", content_name: sku });
+      }
     }
     const pending = takePendingConsult();
     if (!pending) return;
@@ -481,13 +520,14 @@ export default function SolvingMyProblems() {
   const refreshProfile = useCallback(async () => {
     if (!supabase || !userId) return null;
     const [{ data: profile }, { data: sub }] = await Promise.all([
-      supabase.from("profiles").select("free_readings_used, credits").eq("id", userId).maybeSingle(),
+      supabase.from("profiles").select("free_readings_used, credits, email").eq("id", userId).maybeSingle(),
       supabase.from("subscriptions").select("status, current_period_end").eq("profile_id", userId).maybeSingle(),
     ]);
     const active = subscriptionIsActive(sub);
     if (profile) {
       setCredits(profile.credits ?? 0);
       setReadingsUsed(profile.free_readings_used ?? 0);
+      setProfileEmail(profile.email ?? "");
     }
     setSubscribed(active);
     return { credits: profile?.credits ?? 0, subscribed: active };
@@ -551,6 +591,7 @@ export default function SolvingMyProblems() {
         name: fields.mode === "duo" ? fields.yourName : "",
         partnerName: fields.mode === "duo" ? fields.partnerName : "",
         partnerBirthdate: fields.mode === "duo" ? fields.partnerBirthdate : "",
+        email: fields.email || "",
         token: await getAccessToken(),
       });
       setReading(r);
@@ -560,6 +601,9 @@ export default function SolvingMyProblems() {
         // Park the form now: the email-confirmation detour can leave the tab.
         savePendingConsult(fields);
         setShowPaywall(true);
+      } else if (e.code === "email_required") {
+        setEmailError("");
+        setEmailStep(true);
       } else {
         setError("The tools are being temperamental. Give it another try in a moment.");
       }
@@ -568,7 +612,28 @@ export default function SolvingMyProblems() {
   }
 
   function handleConsult() {
+    // The free reading asks for an email first. Paying accounts always have one.
+    if (isSupabaseConfigured && !hasCapturedEmail) {
+      setEmailError("");
+      setEmailStep(true);
+      return undefined;
+    }
     return runConsult(formFields());
+  }
+
+  // Email captured: close the step and run the reading with it. The server
+  // stores the address on the profile and refreshProfile picks it up after.
+  async function submitEmail(e) {
+    e.preventDefault();
+    const email = authEmail.trim().toLowerCase();
+    if (!EMAIL_RE.test(email)) {
+      setEmailError("That doesn't look like an email address.");
+      return;
+    }
+    setEmailStep(false);
+    setAuthEmail(email);
+    trackPixel("Lead");
+    await runConsult({ ...formFields(), email });
   }
 
   async function startCheckout(sku) {
@@ -594,7 +659,12 @@ export default function SolvingMyProblems() {
       }
       if (!response.ok) throw new Error(`checkout failed (${response.status})`);
       const { url } = await response.json();
-      savePendingConsult(formFields());
+      savePendingConsult({ ...formFields(), email: profileEmail || "" });
+      try {
+        localStorage.setItem(CHECKOUT_SKU_KEY, sku);
+      } catch {
+        // storage blocked: the Purchase event just goes without a value
+      }
       window.location.href = url;
     } catch (e) {
       setCheckoutError("Checkout is being temperamental. Give it another try in a moment.");
@@ -683,6 +753,7 @@ export default function SolvingMyProblems() {
     setCredits(0);
     setSubscribed(false);
     setReadingsUsed(0);
+    setProfileEmail("");
     setAuthEmail("");
     setAuthPassword("");
     // Straight back to a fresh anonymous session so the app keeps working.
@@ -943,6 +1014,26 @@ export default function SolvingMyProblems() {
           </div>
         )}
 
+        {/* Email gate — the free reading asks for an address, nothing more */}
+        {emailStep && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-6" style={{ background: "rgba(10,10,26,.85)" }} onClick={() => setEmailStep(false)}>
+            <div className="w-full max-w-sm rounded-3xl p-6" style={{ background: P.nightSoft, border: "1px solid #2E3060" }} onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center justify-between">
+                <h2 className="smp-display text-2xl font-semibold" style={{ color: P.parchment }}>Before the tools speak</h2>
+                <button onClick={() => setEmailStep(false)}><X size={18} style={{ color: P.faint }} /></button>
+              </div>
+              <form onSubmit={submitEmail} className="mt-4 space-y-4">
+                <p className="text-sm" style={{ color: P.faint }}>Leave an email so your readings have somewhere to live. No password, no card — the first one is on the house.</p>
+                <Field label="Email" type="email" required autoComplete="email" autoFocus value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="you@example.com" />
+                {emailError && <p className="text-sm" style={{ color: P.rose }}>{emailError}</p>}
+                <button type="submit" className="w-full rounded-xl py-3.5 font-bold text-sm transition-all active:scale-[.99]" style={{ background: P.gold, color: P.night }}>
+                  Consult the tools
+                </button>
+              </form>
+            </div>
+          </div>
+        )}
+
         {/* Paywall — first reading free, then credits or unlimited */}
         {showPaywall && (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-6" style={{ background: "rgba(10,10,26,.85)" }} onClick={() => { setShowPaywall(false); setAuthStep(""); }}>
@@ -953,8 +1044,10 @@ export default function SolvingMyProblems() {
               </div>
               {authStep === "attach" ? (
                 <form onSubmit={attachEmail} className="mt-4 space-y-4">
-                  <p className="text-sm" style={{ color: P.faint }}>Where should we keep your readings? Your free one comes with you.</p>
-                  <Field label="Email" type="email" required value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="you@example.com" />
+                  <p className="text-sm" style={{ color: P.faint }}>
+                    {authEmail ? "Add a password and your readings come with you." : "Where should we keep your readings? Your free one comes with you."}
+                  </p>
+                  <Field label="Email" type="email" required autoComplete="email" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="you@example.com" />
                   <Field label="Password" type="password" required minLength={8} value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} placeholder="At least 8 characters" />
                   {authError && <p className="text-sm" style={{ color: P.rose }}>{authError}</p>}
                   {authNote && <p className="text-sm" style={{ color: P.lavender }}>{authNote}</p>}
