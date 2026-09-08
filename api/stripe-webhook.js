@@ -12,6 +12,7 @@
 
 import Stripe from "stripe";
 import { createClient } from "@supabase/supabase-js";
+import { sendNow, enqueue, cancelPending, daysFromNow } from "./_emails.js";
 
 export const config = { api: { bodyParser: false } };
 
@@ -80,6 +81,35 @@ async function upsertSubscription(subscription) {
   if (error) throw new Error(`subscription update failed: ${error.message}`);
 }
 
+// PAID sequence (see _emails.js): out of the free sequence, purchase email
+// now, check-in in four days. Exactly-once per session id, so a Stripe retry
+// after a partial failure can't email twice. Never throws — the money side of
+// this webhook is already done by the time we get here.
+async function startPaidSequence(session, uid, sku) {
+  try {
+    let email = session.customer_details?.email || "";
+    if (!email) {
+      const { data: profile } = await admin().from("profiles").select("email").eq("id", uid).maybeSingle();
+      email = profile?.email || "";
+    }
+    if (!email) {
+      const { data } = await admin().auth.admin.getUserById(uid);
+      email = data?.user?.email || "";
+    }
+    // Keep the profile's address current: the paywall may have attached a
+    // different one than the free reading captured.
+    if (email) await admin().from("profiles").update({ email }).eq("id", uid);
+
+    await cancelPending(admin(), uid, ["free_nudge"]);
+    await Promise.all([
+      sendNow(admin(), { profileId: uid, email, kind: "purchase", ref: session.id, payload: { sku } }),
+      enqueue(admin(), { profileId: uid, kind: "paid_checkin", ref: session.id, payload: { sku }, sendAt: daysFromNow(4) }),
+    ]);
+  } catch (e) {
+    console.error(`webhook: paid email sequence for ${uid} failed —`, e.message);
+  }
+}
+
 async function handleCheckoutCompleted(session) {
   const uid = session.metadata?.supabase_uid;
   const sku = session.metadata?.sku;
@@ -105,6 +135,7 @@ async function handleCheckoutCompleted(session) {
     } else {
       console.log(`webhook: +${delta} credits to ${uid} (${reason}, ${session.id})`);
     }
+    await startPaidSequence(session, uid, sku);
     return;
   }
 
@@ -120,6 +151,7 @@ async function handleCheckoutCompleted(session) {
     subscription.metadata = { ...(subscription.metadata || {}), supabase_uid: uid };
     await upsertSubscription(subscription);
     console.log(`webhook: subscription ${subscriptionId} -> ${subscription.status} for ${uid}`);
+    await startPaidSequence(session, uid, sku);
     return;
   }
 

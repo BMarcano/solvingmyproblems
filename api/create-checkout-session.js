@@ -1,6 +1,9 @@
 // /api/create-checkout-session.js — opens a Stripe Checkout session.
 //
-// POST { sku } where sku is single | fivepack | sub.
+// POST { sku, promo? } where sku is single | fivepack | sub and promo is an
+// optional promotion code (the email links carry ?promo=Problems-Solved). A
+// valid promo is pre-applied so the buyer types nothing; otherwise Checkout
+// shows its own "Add promotion code" field. Stripe refuses both at once.
 // Anonymous users are rejected with 409 attach_email: the client converts the
 // account (email + password on the SAME auth user, so credits and history carry
 // over) and retries. Credits themselves are never granted here — only the
@@ -11,6 +14,18 @@ import { createClient } from "@supabase/supabase-js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
 const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+// Stripe: "Only return promotion codes that have this case-insensitive code."
+async function findPromotionCode(code) {
+  if (!code) return null;
+  try {
+    const { data } = await stripe().promotionCodes.list({ code, active: true, limit: 1 });
+    return data?.[0]?.id || null;
+  } catch (e) {
+    console.warn(`checkout: promo lookup for "${code}" failed —`, e.message);
+    return null;
+  }
+}
 
 const SKUS = {
   single: { mode: "payment", priceEnv: "STRIPE_PRICE_SINGLE" },
@@ -85,6 +100,7 @@ export default async function handler(req, res) {
   const sku = body.sku;
   const config = SKUS[sku];
   if (!config) return res.status(400).json({ error: "invalid_sku" });
+  const promo = typeof body.promo === "string" ? body.promo.trim().slice(0, 60) : "";
 
   const price = process.env[config.priceEnv];
   if (!price) {
@@ -108,12 +124,16 @@ export default async function handler(req, res) {
   const origin = req.headers.origin || `https://${req.headers.host}`;
 
   try {
-    const customerId = await findOrCreateCustomer(user.id, user.email);
+    const [customerId, promotionCode] = await Promise.all([
+      findOrCreateCustomer(user.id, user.email),
+      findPromotionCode(promo),
+    ]);
 
     const session = await stripe().checkout.sessions.create({
       mode: config.mode,
       customer: customerId,
       line_items: [{ price, quantity: 1 }],
+      ...(promotionCode ? { discounts: [{ promotion_code: promotionCode }] } : { allow_promotion_codes: true }),
       // The webhook reads these to fulfil the purchase.
       metadata: { supabase_uid: user.id, sku },
       ...(config.mode === "subscription"

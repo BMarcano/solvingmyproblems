@@ -174,3 +174,32 @@ exception
     return false;
 end; $$;
 revoke all on function public.grant_credits(uuid, int, text, text) from public;
+
+-- ---------------------------------------------------------------------------
+-- Email capture + lifecycle sequences (see api/_emails.js)
+-- ---------------------------------------------------------------------------
+
+-- The address captured for the free reading (server-written; there is still
+-- no client write policy on profiles) and the marketing opt-out.
+alter table public.profiles add column if not exists email text;
+alter table public.profiles add column if not exists email_opt_out boolean not null default false;
+create index if not exists profiles_email_idx on public.profiles (email) where email is not null;
+
+-- One row per lifecycle email, immediate or scheduled — the send log and the
+-- queue in one. Written only by the server (service role): no client policies.
+create table if not exists public.email_jobs (
+  id         uuid primary key default gen_random_uuid(),
+  profile_id uuid not null references public.profiles (id) on delete cascade,
+  kind       text not null,                         -- welcome | free_nudge | purchase | paid_checkin
+  ref        text,                                  -- dedupe key: profile id or Stripe session id
+  payload    jsonb not null default '{}'::jsonb,    -- e.g. {"sku": "fivepack"}
+  send_at    timestamptz not null,
+  status     text not null default 'pending',       -- pending | sending | sent | skipped | cancelled | failed
+  sent_at    timestamptz,
+  error      text,
+  created_at timestamptz not null default now()
+);
+alter table public.email_jobs enable row level security;
+create index if not exists email_jobs_due_idx on public.email_jobs (send_at) where status = 'pending';
+-- Exactly-once: a given email for a given ref can only ever be claimed once.
+create unique index if not exists email_jobs_kind_ref_key on public.email_jobs (kind, ref) where ref is not null;

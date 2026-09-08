@@ -256,6 +256,32 @@ function trackPixel(event, params) {
 // event on return carries the right value.
 const CHECKOUT_SKU_KEY = "smp:checkout-sku";
 const SKU_PRICES_USD = { single: 1.99, fivepack: 7.97, sub: 4.99 };
+
+// A promotion code that arrived on the URL (the emails link to
+// ?promo=Problems-Solved). Kept for a month so it is still pre-applied when
+// they come back to buy; the server validates it against Stripe.
+const PROMO_KEY = "smp:promo";
+const PROMO_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+function rememberPromo(code) {
+  try {
+    localStorage.setItem(PROMO_KEY, JSON.stringify({ code, savedAt: Date.now() }));
+  } catch {
+    // storage blocked: Checkout still shows its own promo field
+  }
+}
+
+function storedPromo() {
+  try {
+    const raw = localStorage.getItem(PROMO_KEY);
+    if (!raw) return "";
+    const { code, savedAt } = JSON.parse(raw);
+    if (!code || Date.now() - (savedAt || 0) > PROMO_TTL_MS) return "";
+    return code;
+  } catch {
+    return "";
+  }
+}
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
 // Reads and clears the parked form. Null when there is none or it went stale.
@@ -391,7 +417,7 @@ export default function SolvingMyProblems() {
   const hasCapturedEmail = hasEmail || Boolean(profileEmail);
 
   const skyRef = useRef(null);
-  const welcomeRequestedRef = useRef(false);
+  const [wantLastReading, setWantLastReading] = useState(false);
   // Set once on mount from ?checkout= and the parked form; consumed by the
   // post-checkout effect below.
   const checkoutOutcomeRef = useRef("");
@@ -403,9 +429,14 @@ export default function SolvingMyProblems() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const checkout = params.get("checkout") || "";
+    const promo = (params.get("promo") || "").trim().slice(0, 60);
+    if (promo) rememberPromo(promo);
+    if (params.get("reading") === "last") setWantLastReading(true);
+    if (checkout || promo || params.has("reading")) {
+      window.history.replaceState({}, "", window.location.pathname);
+    }
     if (checkout) {
       checkoutOutcomeRef.current = checkout;
-      window.history.replaceState({}, "", window.location.pathname);
       let sku = "";
       try {
         sku = localStorage.getItem(CHECKOUT_SKU_KEY) || "";
@@ -434,22 +465,38 @@ export default function SolvingMyProblems() {
     }
   }, []);
 
-  // One warm welcome email when the account becomes a real one (email attached).
-  // Fire-and-forget; the server is idempotent, so repeat sessions are no-ops.
+  // "See your reading" from the purchase email (?reading=last): show the most
+  // recent reading on this account. Opened on another device, the session is
+  // a fresh anonymous one with nothing to show, so offer sign-in instead and
+  // try again once they are in (userId changes, this re-runs).
   useEffect(() => {
-    if (!user || user.is_anonymous || !user.email) return;
-    if (user.user_metadata?.smp_welcomed) return;
-    if (welcomeRequestedRef.current) return;
-    welcomeRequestedRef.current = true;
+    if (!wantLastReading || !supabase || !user) return;
+    let cancelled = false;
     (async () => {
-      const token = await getAccessToken();
-      if (!token) return;
-      fetch("/api/welcome", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-      }).catch(() => {});
+      const { data: row } = await supabase
+        .from("readings")
+        .select("problem, result")
+        .eq("profile_id", user.id)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (cancelled) return;
+      if (row?.result) {
+        setProblem(row.problem || "");
+        setReading(row.result);
+        setWantLastReading(false);
+      } else if (user.is_anonymous) {
+        setAuthStep("signin");
+        setAuthError("");
+        setAuthNote("Sign in and your reading will be right here.");
+      } else {
+        setWantLastReading(false);
+      }
     })();
-  }, [user]);
+    return () => {
+      cancelled = true;
+    };
+  }, [wantLastReading, user]);
 
   // The sky leans a few pixels toward the cursor, each layer by a different
   // depth. Direct DOM writes (no React re-render per mouse move), rAF-throttled,
@@ -647,7 +694,7 @@ export default function SolvingMyProblems() {
           "Content-Type": "application/json",
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
-        body: JSON.stringify({ sku }),
+        body: JSON.stringify({ sku, promo: storedPromo() }),
       });
       // Anonymous account: attach an email to this same user first, then retry.
       if (response.status === 409) {

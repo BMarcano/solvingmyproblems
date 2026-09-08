@@ -14,6 +14,7 @@
 //                        else 402 payment_required (client opens the paywall).
 
 import { createClient } from "@supabase/supabase-js";
+import { sendNow, enqueue, daysFromNow } from "./_emails.js";
 
 const GATING_ENABLED = process.env.GATING_ENABLED === "true";
 const PROBLEM_MAX = 600;
@@ -137,13 +138,18 @@ async function runGate(req, res, email) {
   // Capture the email whenever one comes in, before any gating: even a reading
   // that ends in 402 leaves a contact behind.
   let profileEmail = profile?.email || "";
+  let firstCapture = false;
   if (email && email !== profileEmail) {
     const { error: emailError } = await admin().from("profiles").update({ email }).eq("id", userId);
     if (emailError) console.error("consult: storing email failed —", emailError.message);
-    else profileEmail = email;
+    else {
+      firstCapture = !profileEmail;
+      profileEmail = email;
+    }
   }
 
-  if (subscriptionIsActive(sub)) return { userId, spentCredit: false };
+  const captured = firstCapture ? profileEmail : "";
+  if (subscriptionIsActive(sub)) return { userId, spentCredit: false, captured };
 
   const { data: spent, error: spendError } = await admin().rpc("spend_credit", { p_user: userId });
   if (spendError) {
@@ -151,7 +157,7 @@ async function runGate(req, res, email) {
     res.status(500).json({ error: "gate_failed" });
     return null;
   }
-  if (spent === true) return { userId, spentCredit: true };
+  if (spent === true) return { userId, spentCredit: true, captured };
 
   // The free reading is the lead magnet: no email, no reading. Checked here
   // rather than in the browser so devtools can't skip it.
@@ -166,10 +172,22 @@ async function runGate(req, res, email) {
     res.status(500).json({ error: "gate_failed" });
     return null;
   }
-  if (usedFree === true) return { userId, spentCredit: false };
+  if (usedFree === true) return { userId, spentCredit: false, captured };
 
+  // Out of readings — but a freshly captured address still gets its welcome.
+  if (captured) await startFreeSequence(userId, captured).catch(() => {});
   res.status(402).json({ error: "payment_required" });
   return null;
+}
+
+// FREE sequence (see _emails.js): welcome now, nudge in four days. Runs
+// concurrently with the reading so it never adds to the wait; every step
+// swallows its own errors because email must not cost anyone a reading.
+async function startFreeSequence(userId, email) {
+  await Promise.all([
+    sendNow(admin(), { profileId: userId, email, kind: "welcome", ref: userId }),
+    enqueue(admin(), { profileId: userId, kind: "free_nudge", ref: userId, sendAt: daysFromNow(4) }),
+  ]);
 }
 
 // Users never pay for our errors: hand the credit back if generation failed
@@ -225,11 +243,13 @@ export default async function handler(req, res) {
 
   let userId = null;
   let spentCredit = false;
+  let sequence = null;
   if (GATING_ENABLED) {
     const gate = await runGate(req, res, email);
     if (!gate) return; // runGate already responded (401/402/428/500)
     userId = gate.userId;
     spentCredit = gate.spentCredit;
+    if (gate.captured) sequence = startFreeSequence(userId, gate.captured).catch(() => {});
   }
 
   const prompt = buildPrompt({ problem, name, birthdate, birthtime, birthplace, partnerName, partnerBirthdate });
@@ -265,6 +285,9 @@ export default async function handler(req, res) {
       });
     if (error) console.error("consult: storing reading failed —", error.message);
   }
+
+  // Let the welcome email finish before the function is frozen.
+  if (sequence) await sequence;
 
   return res.status(200).json(reading);
 }
