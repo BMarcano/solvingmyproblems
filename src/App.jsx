@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Sparkles, Moon, Hash, Compass, CircleDot, ScrollText, RefreshCw, Share2, Heart, X, Lock, Sun } from "lucide-react";
+import { Sparkles, Moon, Hash, Compass, CircleDot, ScrollText, RefreshCw, Share2, Heart, X, Lock, Sun, Star } from "lucide-react";
 import { supabase, isSupabaseConfigured } from "./supabaseClient";
 
 // ------------------------------------------------------------------
@@ -407,6 +407,9 @@ export default function SolvingMyProblems() {
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
   const [authNote, setAuthNote] = useState("");
+  // --- Owner dashboard (admins allowlist in Supabase, see supabase/admin.sql) ---
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [showAdmin, setShowAdmin] = useState(false);
   // --- Email gate: the free reading asks for an address (no password) ---
   const [profileEmail, setProfileEmail] = useState("");
   const [emailStep, setEmailStep] = useState(false);
@@ -566,11 +569,13 @@ export default function SolvingMyProblems() {
   const userId = user?.id ?? null;
   const refreshProfile = useCallback(async () => {
     if (!supabase || !userId) return null;
-    const [{ data: profile }, { data: sub }] = await Promise.all([
+    const [{ data: profile }, { data: sub }, { data: adminFlag }] = await Promise.all([
       supabase.from("profiles").select("free_readings_used, credits, email").eq("id", userId).maybeSingle(),
       supabase.from("subscriptions").select("status, current_period_end").eq("profile_id", userId).maybeSingle(),
+      supabase.rpc("is_admin"), // false (or a harmless error) until supabase/admin.sql is applied
     ]);
     const active = subscriptionIsActive(sub);
+    setIsAdmin(adminFlag === true);
     if (profile) {
       setCredits(profile.credits ?? 0);
       setReadingsUsed(profile.free_readings_used ?? 0);
@@ -801,6 +806,8 @@ export default function SolvingMyProblems() {
     setSubscribed(false);
     setReadingsUsed(0);
     setProfileEmail("");
+    setIsAdmin(false);
+    setShowAdmin(false);
     setAuthEmail("");
     setAuthPassword("");
     // Straight back to a fresh anonymous session so the app keeps working.
@@ -1147,6 +1154,14 @@ export default function SolvingMyProblems() {
             ) : hasEmail ? (
               <p className="text-[11px]" style={{ color: P.faint }}>
                 {user.email} · <button onClick={signOut} className="font-bold" style={{ color: P.faint }}>sign out</button>
+                {isAdmin && (
+                  <>
+                    {" · "}
+                    <button onClick={() => setShowAdmin(true)} className="font-bold inline-flex items-center gap-1" style={{ color: P.gold }}>
+                      <Star size={10} fill={P.gold} /> the back room
+                    </button>
+                  </>
+                )}
               </p>
             ) : (
               <button onClick={() => { setAuthStep("signin"); setAuthError(""); setAuthNote(""); }} className="text-[11px] font-bold" style={{ color: P.faint }}>
@@ -1156,10 +1171,290 @@ export default function SolvingMyProblems() {
           </div>
         )}
 
+        {showAdmin && isAdmin && <AdminPanel onClose={() => setShowAdmin(false)} />}
+
         <footer className="mt-14 text-center text-[10px] leading-relaxed" style={{ color: "#5B5C86" }}>
           solvingmyproblems.com · readings are for reflection & entertainment, not professional advice.<br />
           The practical steps are yours to keep either way.
         </footer>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------
+   The back room — the owner dashboard. Same shape as The Good Hours'
+   admin panel: who signed up, who paid, comped "unlimited access" by
+   email, copy-all-emails. Everything comes through is_admin()-gated
+   security-definer RPCs (supabase/admin.sql), so a non-admin gets
+   empty lists even if they somehow open this.
+------------------------------------------------------------------- */
+
+const SKU_LABEL = { single: "one reading", fivepack: "five-pack", sub: "unlimited" };
+const EMAIL_LABEL = { welcome: "welcome", free_nudge: "nudge", purchase: "receipt", paid_checkin: "check-in" };
+
+function money(cents) {
+  return `$${((cents || 0) / 100).toFixed(2)}`;
+}
+
+function shortDate(value) {
+  if (!value) return "";
+  return new Date(value).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+// "welcome ✓ · nudge Sep 17" — the lifecycle-email trail for one person.
+function emailTrail(emails) {
+  if (!Array.isArray(emails) || emails.length === 0) return "no emails yet";
+  return emails
+    .map((e) => {
+      const label = EMAIL_LABEL[e.kind] || e.kind;
+      if (e.status === "sent") return `${label} ✓`;
+      if (e.status === "pending" || e.status === "sending") return `${label} ${shortDate(e.send_at)}`;
+      if (e.status === "failed") return `${label} ✗`;
+      return `${label} —`;
+    })
+    .join(" · ");
+}
+
+function Pill({ tone = "faint", children }) {
+  const tones = {
+    gold: { color: P.gold, background: P.goldSoft, border: `${P.gold}55` },
+    lavender: { color: P.lavender, background: "rgba(184,169,232,.14)", border: "rgba(184,169,232,.35)" },
+    rose: { color: P.rose, background: "rgba(232,139,163,.14)", border: "rgba(232,139,163,.35)" },
+    faint: { color: P.faint, background: "rgba(142,143,184,.12)", border: "#2E3060" },
+  };
+  const t = tones[tone] || tones.faint;
+  return (
+    <span className="smp-mono text-[9px] tracking-[.15em] uppercase px-2 py-0.5 rounded-full whitespace-nowrap" style={{ color: t.color, background: t.background, border: `1px solid ${t.border}` }}>
+      {children}
+    </span>
+  );
+}
+
+function Stat({ label, value, sub }) {
+  return (
+    <div className="rounded-2xl p-4" style={{ background: P.night, border: "1px solid #2E3060" }}>
+      <p className="smp-mono text-[9px] tracking-[.25em] uppercase" style={{ color: P.faint }}>{label}</p>
+      <p className="smp-display text-3xl font-semibold leading-none mt-2" style={{ color: P.parchment }}>{value}</p>
+      {sub && <p className="text-[11px] mt-1.5" style={{ color: P.faint }}>{sub}</p>}
+    </div>
+  );
+}
+
+function AdminPanel({ onClose }) {
+  const [users, setUsers] = useState([]);
+  const [comps, setComps] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [filter, setFilter] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [compEmail, setCompEmail] = useState("");
+  const [compNote, setCompNote] = useState("");
+  const [compBusy, setCompBusy] = useState(false);
+  const [compResult, setCompResult] = useState(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setLoadError("");
+    const [usersRes, compRes] = await Promise.all([supabase.rpc("admin_users_list"), supabase.rpc("admin_comp_list")]);
+    if (usersRes.error) {
+      console.error("admin_users_list failed:", usersRes.error.message);
+      setLoadError("Could not load the list — has supabase/admin.sql been run?");
+    }
+    if (compRes.error) console.error("admin_comp_list failed:", compRes.error.message);
+    setUsers(usersRes.data ?? []);
+    setComps(compRes.data ?? []);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const withEmail = users.filter((u) => u.email);
+  const paying = users.filter((u) => u.is_paying);
+  const unlimited = users.filter((u) => u.is_unlimited && !u.is_comped);
+  const comped = users.filter((u) => u.is_comped);
+  const readings = users.reduce((n, u) => n + Number(u.readings_count || 0), 0);
+  const revenue = users.reduce((n, u) => n + Number(u.spent_cents || 0), 0);
+  const emailsSent = users.reduce((n, u) => n + (u.emails || []).filter((e) => e.status === "sent").length, 0);
+  const emailsPending = users.reduce((n, u) => n + (u.emails || []).filter((e) => e.status === "pending").length, 0);
+  const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const newThisWeek = withEmail.filter((u) => new Date(u.created_at).getTime() > weekAgo).length;
+
+  const q = filter.trim().toLowerCase();
+  const shown = q ? users.filter((u) => (u.email || "").toLowerCase().includes(q)) : users;
+
+  async function copyEmails() {
+    const list = withEmail.filter((u) => !u.email_opt_out).map((u) => u.email).join(", ");
+    try {
+      await navigator.clipboard.writeText(list);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {
+      window.prompt("Copy the list:", list);
+    }
+  }
+
+  async function grantAccess() {
+    const email = compEmail.trim();
+    if (!email || compBusy) return;
+    setCompBusy(true);
+    setCompResult(null);
+    const { data, error } = await supabase.rpc("admin_grant_access", { p_email: email, p_note: compNote.trim() || null });
+    setCompBusy(false);
+    if (error) {
+      setCompResult({ tone: "bad", text: error.message.includes("invalid") ? "That doesn't look like an email." : "Could not grant access — try again." });
+      return;
+    }
+    if (!data?.registered) setCompResult({ tone: "good", text: `Saved. Unlimited turns on the moment ${data?.email} shows up.` });
+    else if (data?.already_paying) setCompResult({ tone: "good", text: `${data.email} already pays for unlimited — nothing changed, the grant is saved for later.` });
+    else setCompResult({ tone: "good", text: `${data?.email} has unlimited + the Daily Card now.` });
+    setCompEmail("");
+    setCompNote("");
+    load();
+  }
+
+  async function revokeAccess(email) {
+    if (compBusy) return;
+    setCompBusy(true);
+    const { error } = await supabase.rpc("admin_revoke_access", { p_email: email });
+    setCompBusy(false);
+    if (error) setCompResult({ tone: "bad", text: "Could not remove that — try again." });
+    load();
+  }
+
+  function statusPills(u) {
+    const pills = [];
+    if (u.is_comped) pills.push(<Pill key="comp" tone="lavender">free access</Pill>);
+    else if (u.is_unlimited) pills.push(<Pill key="unl" tone="gold">unlimited</Pill>);
+    else if (u.is_paying) pills.push(<Pill key="pay" tone="gold">paying</Pill>);
+    else if (u.email) pills.push(<Pill key="lead">lead</Pill>);
+    else pills.push(<Pill key="anon">anonymous</Pill>);
+    if (u.credits > 0) pills.push(<Pill key="cr">{u.credits} credit{u.credits === 1 ? "" : "s"}</Pill>);
+    if (u.email_opt_out) pills.push(<Pill key="out" tone="rose">unsubscribed</Pill>);
+    return pills;
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-start sm:items-center justify-center p-3 sm:p-6" style={{ background: "rgba(10,10,26,.88)" }} onClick={onClose}>
+      <div className="w-full max-w-2xl rounded-3xl p-5 sm:p-6 max-h-[94vh] overflow-y-auto" style={{ background: P.nightSoft, border: "1px solid #2E3060" }} onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <p className="smp-mono text-[10px] tracking-[.3em] uppercase" style={{ color: P.gold }}>Owner dashboard</p>
+            <h2 className="smp-display text-3xl font-semibold mt-1" style={{ color: P.parchment }}>The back room</h2>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button onClick={load} disabled={loading} className="p-2 rounded-lg disabled:opacity-40" style={{ color: P.faint }} title="Refresh">
+              <RefreshCw size={16} className={loading ? "spin-slow" : ""} />
+            </button>
+            <button onClick={onClose} className="p-2 rounded-lg" style={{ color: P.faint }}>
+              <X size={18} />
+            </button>
+          </div>
+        </div>
+
+        {loadError && <p className="text-sm mt-4" style={{ color: P.rose }}>{loadError}</p>}
+
+        {/* The numbers */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mt-5">
+          <Stat label="Signups" value={withEmail.length} sub={`${newThisWeek} this week`} />
+          <Stat label="Readings" value={readings} sub={`${users.filter((u) => u.free_used).length} free ones used`} />
+          <Stat label="Paying" value={paying.length} sub={`${unlimited.length} unlimited${comped.length ? ` · ${comped.length} free access` : ""}`} />
+          <Stat label="Revenue" value={money(revenue)} sub="what Stripe charged, after codes" />
+          <Stat label="Emails sent" value={emailsSent} sub={`${emailsPending} scheduled`} />
+          <Stat label="Unsubscribed" value={users.filter((u) => u.email_opt_out).length} sub="of the marketing list" />
+        </div>
+
+        {/* Unlimited access — comp an influencer without touching the DB */}
+        <div className="mt-6">
+          <Label>Unlimited access</Label>
+          <div className="rounded-2xl p-4 space-y-2.5" style={{ background: P.night, border: "1px solid #2E3060" }}>
+            <p className="text-[12px]" style={{ color: P.faint }}>
+              Give someone unlimited readings and the Daily Card, free. Works before they've ever visited — it switches on the moment that email shows up.
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <Field label="Email" type="email" autoComplete="off" value={compEmail} onChange={(e) => setCompEmail(e.target.value)} placeholder="email@example.com" />
+              <Field label="Note · optional" value={compNote} onChange={(e) => setCompNote(e.target.value)} placeholder="influencer, IG @handle…" />
+            </div>
+            <button
+              onClick={grantAccess}
+              disabled={!compEmail.trim() || compBusy}
+              className="w-full rounded-xl py-3 text-sm font-bold transition-all active:scale-[.99] disabled:opacity-40"
+              style={{ background: P.goldSoft, color: P.gold, border: `1px solid ${P.gold}55` }}
+            >
+              {compBusy ? "Working…" : "Give unlimited access"}
+            </button>
+            {compResult && <p className="text-[12px]" style={{ color: compResult.tone === "bad" ? P.rose : P.lavender }}>{compResult.text}</p>}
+            {comps.length > 0 && (
+              <div className="space-y-2 pt-1 max-h-48 overflow-y-auto">
+                {comps.map((c) => (
+                  <div key={c.email} className="flex items-center justify-between gap-3">
+                    <span className="min-w-0">
+                      <span className="text-[12px] font-bold block truncate" style={{ color: P.parchment }}>{c.email}</span>
+                      {c.note && <span className="text-[11px] block truncate" style={{ color: P.faint }}>{c.note}</span>}
+                    </span>
+                    <span className="flex items-center gap-2 shrink-0">
+                      <Pill tone={c.active ? "lavender" : "faint"}>{c.active ? "active" : "waiting"}</Pill>
+                      <button onClick={() => revokeAccess(c.email)} disabled={compBusy} className="text-[11px] font-bold" style={{ color: P.rose }}>Remove</button>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Signups — who came through, what they did, which emails they got */}
+        <div className="mt-6">
+          <div className="flex items-end justify-between gap-3 mb-2">
+            <Label>People</Label>
+            <button
+              onClick={copyEmails}
+              disabled={withEmail.length === 0}
+              className="mb-2 px-3 py-1.5 rounded-lg text-[11px] font-bold transition-all active:scale-95 disabled:opacity-40"
+              style={{ color: P.gold, border: `1px solid ${P.gold}55`, background: P.goldSoft }}
+            >
+              {copied ? "Copied ✓" : "Copy all emails"}
+            </button>
+          </div>
+          <div className="rounded-2xl p-4" style={{ background: P.night, border: "1px solid #2E3060" }}>
+            <input
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="Find an email…"
+              className="smp-field w-full rounded-lg px-4 text-sm outline-none border mb-3"
+              style={{ background: P.nightSoft, borderColor: "#2E3060", color: P.parchment }}
+            />
+            <div className="space-y-3 max-h-[46vh] overflow-y-auto pr-1">
+              {loading && users.length === 0 ? (
+                <p className="text-center text-sm py-6" style={{ color: P.faint }}>Consulting the ledger…</p>
+              ) : shown.length === 0 ? (
+                <p className="text-center text-sm py-6" style={{ color: P.faint }}>{q ? "Nobody matches that." : "Nobody yet. The ads will fix that."}</p>
+              ) : (
+                shown.map((u) => (
+                  <div key={u.id} className="rounded-xl p-3" style={{ background: P.nightSoft, border: "1px solid #2E3060" }}>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-[13px] font-bold truncate" style={{ color: u.email ? P.parchment : P.faint }}>{u.email || "no email"}</p>
+                        <p className="text-[11px] mt-0.5" style={{ color: P.faint }}>
+                          joined {shortDate(u.created_at)}
+                          {Number(u.readings_count) > 0 && ` · ${u.readings_count} reading${Number(u.readings_count) === 1 ? "" : "s"}`}
+                          {u.last_reading && `, last ${shortDate(u.last_reading)}`}
+                          {Number(u.spent_cents) > 0 && ` · ${money(u.spent_cents)}`}
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap gap-1 justify-end shrink-0 max-w-[45%]">{statusPills(u)}</div>
+                    </div>
+                    <p className="smp-mono text-[10px] mt-2 truncate" style={{ color: u.emails?.some((e) => e.status === "failed") ? P.rose : P.faint }} title={emailTrail(u.emails)}>
+                      {emailTrail(u.emails)}
+                    </p>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );

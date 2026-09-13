@@ -17,3 +17,7 @@ dist/
 npm-debug.log*
 .DS_Store
 Thumbs.db
+
+# Cowork session outputs (previews saved by the Claude app)
+Claude outputs/
+_to_delete/

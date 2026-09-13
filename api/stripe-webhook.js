@@ -110,6 +110,24 @@ async function startPaidSequence(session, uid, sku) {
   }
 }
 
+// The money trail for the owner dashboard: what Stripe actually charged for
+// this session, after any promo code. Idempotent on the session id; a failure
+// here is logged and never blocks fulfilment.
+async function recordPurchase(session, uid, sku) {
+  const { error } = await admin().from("purchases").upsert(
+    {
+      stripe_session_id: session.id,
+      profile_id: uid,
+      sku,
+      amount_cents: session.amount_total ?? 0,
+      discount_cents: session.total_details?.amount_discount ?? 0,
+      currency: session.currency || "usd",
+    },
+    { onConflict: "stripe_session_id" }
+  );
+  if (error) console.error(`webhook: could not record purchase ${session.id} —`, error.message);
+}
+
 async function handleCheckoutCompleted(session) {
   const uid = session.metadata?.supabase_uid;
   const sku = session.metadata?.sku;
@@ -117,6 +135,7 @@ async function handleCheckoutCompleted(session) {
     console.error(`webhook: session ${session.id} has no supabase_uid/sku metadata — skipping`);
     return;
   }
+  await recordPurchase(session, uid, sku);
 
   if (sku === "single" || sku === "fivepack") {
     const delta = sku === "single" ? 1 : 5;
