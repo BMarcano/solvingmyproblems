@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import handler from "./send-invite.js";
+import handler from "../api/send-invite.js";
 
 function response() {
   const result = { code: null, body: null };
