@@ -15,6 +15,7 @@
 
 import { createClient } from "@supabase/supabase-js";
 import { sendNow, enqueue, daysFromNow } from "./_emails.js";
+import { getFullAccess } from "./_access.js";
 
 const GATING_ENABLED = process.env.GATING_ENABLED === "true";
 const PROBLEM_MAX = 600;
@@ -39,15 +40,6 @@ function admin() {
     });
   }
   return adminClient;
-}
-
-function subscriptionIsActive(sub) {
-  if (!sub) return false;
-  if (sub.status !== "active" && sub.status !== "trialing") return false;
-  if (sub.current_period_end && new Date(sub.current_period_end).getTime() < Date.now()) {
-    return false;
-  }
-  return true;
 }
 
 // The reading prompt — kept verbatim from the approved mockup's consultTheTools,
@@ -128,28 +120,42 @@ async function runGate(req, res, email) {
   }
   const userId = userData.user.id;
 
-  const [{ data: sub, error: subError }, { data: profile, error: profileError }] = await Promise.all([
-    admin().from("subscriptions").select("status, current_period_end").eq("profile_id", userId).maybeSingle(),
-    admin().from("profiles").select("email").eq("id", userId).maybeSingle(),
-  ]);
-  if (subError) console.warn("consult: subscription lookup failed —", subError.message);
-  if (profileError) console.warn("consult: profile lookup failed —", profileError.message);
+  const { data: profile, error: profileError } = await admin()
+    .from("profiles").select("email").eq("id", userId).maybeSingle();
+  if (profileError || !profile) {
+    console.error("consult: profile lookup failed —", profileError?.message || "profile missing");
+    res.status(503).json({ error: "access_unavailable" });
+    return null;
+  }
 
   // Capture the email whenever one comes in, before any gating: even a reading
   // that ends in 402 leaves a contact behind.
   let profileEmail = profile?.email || "";
   let firstCapture = false;
   if (email && email !== profileEmail) {
-    const { error: emailError } = await admin().from("profiles").update({ email }).eq("id", userId);
-    if (emailError) console.error("consult: storing email failed —", emailError.message);
-    else {
-      firstCapture = !profileEmail;
-      profileEmail = email;
+    const { data: updated, error: emailError } = await admin()
+      .from("profiles").update({ email }).eq("id", userId).select("id").maybeSingle();
+    if (emailError || !updated) {
+      console.error("consult: storing email failed —", emailError?.message || "profile missing");
+      res.status(503).json({ error: "access_unavailable" });
+      return null;
     }
+    firstCapture = !profileEmail;
+    profileEmail = email;
   }
 
   const captured = firstCapture ? profileEmail : "";
-  if (subscriptionIsActive(sub)) return { userId, spentCredit: false, captured };
+  let access;
+  try {
+    // Query after the email write: it may have activated the grant for this
+    // profile, and a grant may also belong to another anonymous device.
+    access = await getFullAccess(admin(), { userId, user: userData.user, profileEmail });
+  } catch (error) {
+    console.error("consult: access lookup failed —", error.message);
+    res.status(503).json({ error: "access_unavailable" });
+    return null;
+  }
+  if (access.subscribed) return { userId, spentCredit: false, captured: access.comped ? "" : captured };
 
   const { data: spent, error: spendError } = await admin().rpc("spend_credit", { p_user: userId });
   if (spendError) {

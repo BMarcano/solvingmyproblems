@@ -211,14 +211,6 @@ async function pullDailyCard({ birthdate, token }) {
   return response.json();
 }
 
-// A subscription only counts while Stripe says it is live.
-function subscriptionIsActive(sub) {
-  if (!sub) return false;
-  if (sub.status !== "active" && sub.status !== "trialing") return false;
-  if (sub.current_period_end && new Date(sub.current_period_end).getTime() < Date.now()) return false;
-  return true;
-}
-
 async function getAccessToken() {
   if (!supabase) return null;
   const { data } = await supabase.auth.getSession();
@@ -255,6 +247,7 @@ function trackPixel(event, params) {
 // Which plan was chosen, parked across the Stripe redirect so the Purchase
 // event on return carries the right value.
 const CHECKOUT_SKU_KEY = "smp:checkout-sku";
+const INVITE_TOKEN_KEY = "smp:invite-token";
 const SKU_PRICES_USD = { single: 1.99, fivepack: 7.97, sub: 4.99 };
 
 // A promotion code that arrived on the URL (the emails link to
@@ -386,6 +379,7 @@ export default function SolvingMyProblems() {
   // --- Monetization: first reading free, then credits or subscription ---
   const [credits, setCredits] = useState(0);
   const [subscribed, setSubscribed] = useState(false);
+  const [accessStatus, setAccessStatus] = useState(isSupabaseConfigured ? "loading" : "ready"); // loading | ready | error
   const [showPaywall, setShowPaywall] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   // --- Compatibility mode ---
@@ -396,6 +390,9 @@ export default function SolvingMyProblems() {
   // --- Daily Card (subscriber ritual) ---
   const [daily, setDaily] = useState(null);
   const [dailyLoading, setDailyLoading] = useState(false);
+  const [dailyError, setDailyError] = useState("");
+  const [inviteNotice, setInviteNotice] = useState("");
+  const [inviteRetry, setInviteRetry] = useState(false);
   // --- Account + checkout ---
   const [user, setUser] = useState(null);
   const [checkoutBusy, setCheckoutBusy] = useState("");
@@ -420,6 +417,8 @@ export default function SolvingMyProblems() {
   const hasCapturedEmail = hasEmail || Boolean(profileEmail);
 
   const skyRef = useRef(null);
+  const inviteTokenRef = useRef("");
+  const inviteRedeemingRef = useRef(false);
   const [wantLastReading, setWantLastReading] = useState(false);
   // Set once on mount from ?checkout= and the parked form; consumed by the
   // post-checkout effect below.
@@ -433,9 +432,16 @@ export default function SolvingMyProblems() {
     const params = new URLSearchParams(window.location.search);
     const checkout = params.get("checkout") || "";
     const promo = (params.get("promo") || "").trim().slice(0, 60);
+    const inviteToken = (params.get("invite") || "").trim();
+    try {
+      inviteTokenRef.current = inviteToken || sessionStorage.getItem(INVITE_TOKEN_KEY) || "";
+      if (inviteToken) sessionStorage.setItem(INVITE_TOKEN_KEY, inviteToken);
+    } catch {
+      inviteTokenRef.current = inviteToken;
+    }
     if (promo) rememberPromo(promo);
     if (params.get("reading") === "last") setWantLastReading(true);
-    if (checkout || promo || params.has("reading")) {
+    if (checkout || promo || params.has("reading") || params.has("invite")) {
       window.history.replaceState({}, "", window.location.pathname);
     }
     if (checkout) {
@@ -547,7 +553,10 @@ export default function SolvingMyProblems() {
       let session = data?.session ?? null;
       if (!session) {
         const { data: anon, error: anonError } = await supabase.auth.signInAnonymously();
-        if (anonError) console.error("anonymous sign-in failed:", anonError.message);
+        if (anonError) {
+          console.error("anonymous sign-in failed:", anonError.message);
+          if (!cancelled) setAccessStatus("error");
+        }
         session = anon?.session ?? null;
       }
       if (!cancelled) setUser(session?.user ?? null);
@@ -561,33 +570,86 @@ export default function SolvingMyProblems() {
     };
   }, []);
 
-  // Real credits / subscription / free-reading counter, straight from the
-  // tables (select-own via RLS). The server is what actually decides.
+  // The server resolves paid access and email-based invitations for this exact
+  // session. A database timeout must not be displayed as a locked account.
   // Keyed on the id, not the user object: the auth listener hands back a fresh
   // object for the same account (token refreshes, INITIAL_SESSION), and that
   // must not restart the post-checkout delivery below.
   const userId = user?.id ?? null;
   const refreshProfile = useCallback(async () => {
     if (!supabase || !userId) return null;
-    const [{ data: profile }, { data: sub }, { data: adminFlag }] = await Promise.all([
-      supabase.from("profiles").select("free_readings_used, credits, email").eq("id", userId).maybeSingle(),
-      supabase.from("subscriptions").select("status, current_period_end").eq("profile_id", userId).maybeSingle(),
-      supabase.rpc("is_admin"), // false (or a harmless error) until supabase/admin.sql is applied
-    ]);
-    const active = subscriptionIsActive(sub);
-    setIsAdmin(adminFlag === true);
-    if (profile) {
-      setCredits(profile.credits ?? 0);
-      setReadingsUsed(profile.free_readings_used ?? 0);
-      setProfileEmail(profile.email ?? "");
+    setAccessStatus("loading");
+    try {
+      const token = await getAccessToken();
+      if (!token) throw new Error("session unavailable");
+      const [accessResult, adminResult] = await Promise.allSettled([
+        fetch("/api/access", { headers: { Authorization: `Bearer ${token}` } }),
+        supabase.rpc("is_admin"),
+      ]);
+      if (adminResult.status === "fulfilled" && !adminResult.value.error) {
+        setIsAdmin(adminResult.value.data === true);
+      }
+      if (accessResult.status === "rejected") throw accessResult.reason;
+      const response = accessResult.value;
+      if (!response.ok) throw new Error(`access lookup failed (${response.status})`);
+      const access = await response.json();
+      setCredits(access.credits ?? 0);
+      setReadingsUsed(access.free_readings_used ?? 0);
+      setProfileEmail(access.email ?? "");
+      setSubscribed(access.subscribed === true);
+      setAccessStatus("ready");
+      if (access.subscribed) setShowPaywall(false);
+      return { credits: access.credits ?? 0, subscribed: access.subscribed === true };
+    } catch (error) {
+      console.error("Could not refresh access:", error);
+      setAccessStatus("error");
+      return null;
     }
-    setSubscribed(active);
-    return { credits: profile?.credits ?? 0, subscribed: active };
   }, [userId]);
 
+  const redeemInvite = useCallback(async () => {
+    if (!userId || !inviteTokenRef.current || inviteRedeemingRef.current) return;
+    inviteRedeemingRef.current = true;
+    setAccessStatus("loading");
+    setInviteNotice("");
+    setInviteRetry(false);
+    try {
+      const token = await getAccessToken();
+      if (!token) throw new Error("session unavailable");
+      const response = await fetch("/api/redeem-invite", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ token: inviteTokenRef.current }),
+      });
+      if (response.status === 409) {
+        setInviteNotice("This invitation belongs to another account. Sign out to activate it in a fresh session.");
+        return;
+      }
+      if (response.status === 410) {
+        inviteTokenRef.current = "";
+        try { sessionStorage.removeItem(INVITE_TOKEN_KEY); } catch { /* storage unavailable */ }
+        setInviteNotice("This invitation has expired. Ask for a new one.");
+        return;
+      }
+      if (!response.ok) throw new Error(`invitation activation failed (${response.status})`);
+      inviteTokenRef.current = "";
+      try { sessionStorage.removeItem(INVITE_TOKEN_KEY); } catch { /* storage unavailable */ }
+      setInviteNotice("Your full access is ready.");
+    } catch (error) {
+      console.error("Could not activate invitation:", error);
+      setInviteNotice("Could not activate your invitation right now. Please try again.");
+      setInviteRetry(true);
+    } finally {
+      inviteRedeemingRef.current = false;
+      await refreshProfile();
+    }
+  }, [userId, refreshProfile]);
+
   useEffect(() => {
-    refreshProfile();
-  }, [refreshProfile]);
+    if (!userId) return;
+    if (inviteTokenRef.current) redeemInvite();
+    else refreshProfile();
+  }, [userId, refreshProfile, redeemInvite]);
 
   // Back from a successful Stripe checkout. The webhook may still be in
   // flight, so poll until the credit or subscription shows up (up to ~30s),
@@ -804,6 +866,7 @@ export default function SolvingMyProblems() {
     setDaily(null);
     setCredits(0);
     setSubscribed(false);
+    setAccessStatus("loading");
     setReadingsUsed(0);
     setProfileEmail("");
     setIsAdmin(false);
@@ -865,6 +928,13 @@ export default function SolvingMyProblems() {
             Bring the tools of five ancient advisors to one modern problem. Tarot, the I Ching, numerology, the stars — and, for tie-breaks, the 8-ball.
           </p>
         </header>
+
+        {inviteNotice && (
+          <div role="status" className="mt-6 rounded-2xl p-4 text-sm" style={{ background: P.nightSoft, border: `1px solid ${inviteRetry ? P.rose : P.lavender}`, color: P.parchment }}>
+            {inviteNotice}
+            {inviteRetry && <button onClick={redeemInvite} className="ml-2 font-bold" style={{ color: P.gold }}>Try again →</button>}
+          </div>
+        )}
 
         {/* Input */}
         {!reading && (
@@ -943,9 +1013,13 @@ export default function SolvingMyProblems() {
                 <Sun size={16} style={{ color: P.gold }} />
                 <p className="smp-mono text-[10px] tracking-[.25em] uppercase" style={{ color: P.gold }}>Your Daily Card</p>
               </div>
-              {!subscribed && <Lock size={13} style={{ color: P.faint }} />}
+              {accessStatus === "ready" && !subscribed && <Lock size={13} style={{ color: P.faint }} />}
             </div>
-            {subscribed ? (
+            {accessStatus === "loading" ? (
+              <p className="text-sm mt-3" style={{ color: P.faint }}>Checking your access…</p>
+            ) : accessStatus === "error" ? (
+              <button onClick={userId ? refreshProfile : () => window.location.reload()} className="mt-3 text-sm font-bold" style={{ color: P.gold }}>Could not check your access. Try again →</button>
+            ) : subscribed ? (
               daily ? (
                 <div className="mt-3">
                   <h3 className="smp-display text-2xl font-semibold" style={{ color: P.parchment }}>{daily.card}</h3>
@@ -955,7 +1029,18 @@ export default function SolvingMyProblems() {
               ) : (
                 <button
                   disabled={dailyLoading}
-                  onClick={async () => { setDailyLoading(true); try { setDaily(await pullDailyCard({ birthdate, token: await getAccessToken() })); } catch {} setDailyLoading(false); }}
+                  onClick={async () => {
+                    setDailyLoading(true);
+                    setDailyError("");
+                    try {
+                      setDaily(await pullDailyCard({ birthdate, token: await getAccessToken() }));
+                    } catch (error) {
+                      console.error("Daily Card failed:", error);
+                      setDailyError("Could not load your card. Please try again.");
+                    } finally {
+                      setDailyLoading(false);
+                    }
+                  }}
                   className="mt-3 w-full rounded-xl py-3 text-sm font-bold transition-all active:scale-[.99]"
                   style={{ background: P.goldSoft, color: P.gold, border: `1px solid ${P.gold}55` }}
                 >
@@ -963,12 +1048,16 @@ export default function SolvingMyProblems() {
                 </button>
               )
             ) : (
-              <button onClick={() => setShowPaywall(true)} className="mt-2 text-left w-full">
-                <p className="text-sm" style={{ color: P.faint }}>
-                  One card, every morning, read against your chart. <span style={{ color: P.gold }}>Unlock with unlimited · $4.99/mo →</span>
-                </p>
-              </button>
+              <div className="mt-2">
+                <button onClick={() => setShowPaywall(true)} className="text-left w-full">
+                  <p className="text-sm" style={{ color: P.faint }}>
+                    One card, every morning, read against your chart. <span style={{ color: P.gold }}>Unlock with unlimited · $4.99/mo →</span>
+                  </p>
+                </button>
+                <button onClick={refreshProfile} className="mt-2 text-xs font-bold" style={{ color: P.lavender }}>Already invited? Check access</button>
+              </div>
             )}
+            {dailyError && <p className="text-sm mt-2" style={{ color: P.rose }}>{dailyError}</p>}
           </section>
         )}
 
@@ -1127,6 +1216,7 @@ export default function SolvingMyProblems() {
                       <p className="text-xs mt-0.5" style={{ color: "#C9C7E3" }}>Every problem, plus one card every morning</p>
                     </button>
                   </div>
+                  <button type="button" onClick={refreshProfile} className="mt-3 w-full py-2 text-xs font-bold" style={{ color: P.lavender }}>Already invited? Check access</button>
                   {checkoutError && <p className="text-sm mt-3" style={{ color: P.rose }}>{checkoutError}</p>}
                 </>
               )}

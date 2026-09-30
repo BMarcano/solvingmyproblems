@@ -14,11 +14,12 @@ function response() {
 
 test("only a saved admin grant can trigger an invitation, and delivery failures are visible", async () => {
   const originalFetch = globalThis.fetch;
-  const names = ["SUPABASE_URL", "SUPABASE_ANON_KEY", "RESEND_API_KEY"];
+  const names = ["SUPABASE_URL", "SUPABASE_ANON_KEY", "RESEND_API_KEY", "EMAIL_SECRET"];
   const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
   process.env.SUPABASE_URL = "https://test.supabase.co";
   process.env.SUPABASE_ANON_KEY = "public-key";
   process.env.RESEND_API_KEY = "test-key";
+  process.env.EMAIL_SECRET = "test-invitation-secret";
 
   try {
     const request = { method: "POST", headers: { authorization: "Bearer admin-token" }, body: { email: " Guest@Example.com " } };
@@ -34,10 +35,11 @@ test("only a saved admin grant can trigger an invitation, and delivery failures 
     assert.equal(sends, 0);
 
     globalThis.fetch = async (url, options) => {
-      if (url.includes("admin_comp_list")) return { ok: true, json: async () => [{ email: "guest@example.com" }] };
+      if (url.includes("admin_comp_list")) return { ok: true, json: async () => [{ email: "guest@example.com", created_at: "2026-09-30T00:00:00Z" }] };
       sends += 1;
       assert.equal(url, "https://api.resend.com/emails");
       assert.deepEqual(JSON.parse(options.body).to, ["guest@example.com"]);
+      assert.match(JSON.parse(options.body).html, /\?invite=[A-Za-z0-9_-]+/);
       return { ok: true, json: async () => ({ id: "email-123" }) };
     };
     const sent = response();
@@ -47,7 +49,7 @@ test("only a saved admin grant can trigger an invitation, and delivery failures 
     assert.equal(sends, 1);
 
     globalThis.fetch = async (url) => url.includes("admin_comp_list")
-      ? { ok: true, json: async () => [{ email: "guest@example.com" }] }
+      ? { ok: true, json: async () => [{ email: "guest@example.com", created_at: "2026-09-30T00:00:00Z" }] }
       : { ok: false, status: 422, text: async () => "Rejected" };
     const failed = response();
     const originalError = console.error;

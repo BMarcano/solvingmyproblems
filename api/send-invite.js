@@ -1,5 +1,6 @@
 // Admin-only invitation for an email already granted complimentary access.
-import { deliver, invitationEmail } from "./_emails.js";
+import { deliver, invitationEmail, SITE } from "./_emails.js";
+import { createInvitationToken } from "./_invite-token.js";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
@@ -40,11 +41,13 @@ export default async function handler(req, res) {
       return res.status(502).json({ error: "Could not verify the access grant" });
     }
     const grants = await grantsResponse.json();
-    if (!Array.isArray(grants) || !grants.some((grant) => grant.email === email)) {
+    const grant = Array.isArray(grants) ? grants.find((item) => item.email === email) : null;
+    if (!grant) {
       return res.status(403).json({ error: "No access grant found for this email" });
     }
 
-    const { subject, html } = invitationEmail();
+    const inviteLink = `${SITE}/?invite=${createInvitationToken(email, grant.created_at)}`;
+    const { subject, html } = invitationEmail({ inviteLink });
     const id = await deliver({ to: email, subject, html });
     return res.status(200).json({ sent: true, id });
   } catch (error) {

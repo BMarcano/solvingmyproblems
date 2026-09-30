@@ -6,6 +6,7 @@
 // returns the cached card, so a subscriber costs at most one Claude call a day.
 
 import { createClient } from "@supabase/supabase-js";
+import { getFullAccess } from "./_access.js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
 const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -18,15 +19,6 @@ function admin() {
     });
   }
   return adminClient;
-}
-
-function subscriptionIsActive(sub) {
-  if (!sub) return false;
-  if (sub.status !== "active" && sub.status !== "trialing") return false;
-  if (sub.current_period_end && new Date(sub.current_period_end).getTime() < Date.now()) {
-    return false;
-  }
-  return true;
 }
 
 // The daily pull prompt — kept verbatim from the approved mockup's
@@ -87,17 +79,20 @@ export default async function handler(req, res) {
   if (userError || !userData?.user) return res.status(401).json({ error: "unauthorized" });
   const userId = userData.user.id;
 
-  // The Daily Card is the subscriber ritual — no subscription, no card.
-  const { data: sub, error: subError } = await admin()
-    .from("subscriptions")
-    .select("status, current_period_end")
-    .eq("profile_id", userId)
-    .maybeSingle();
-  if (subError) {
-    console.error("daily-card: subscription lookup failed —", subError.message);
-    return res.status(500).json({ error: "gate_failed" });
+  const { data: profile, error: profileError } = await admin()
+    .from("profiles").select("email").eq("id", userId).maybeSingle();
+  if (profileError || !profile) {
+    console.error("daily-card: profile lookup failed —", profileError?.message || "profile missing");
+    return res.status(503).json({ error: "access_unavailable" });
   }
-  if (!subscriptionIsActive(sub)) {
+  let access;
+  try {
+    access = await getFullAccess(admin(), { userId, user: userData.user, profileEmail: profile.email });
+  } catch (error) {
+    console.error("daily-card: access lookup failed —", error.message);
+    return res.status(503).json({ error: "access_unavailable" });
+  }
+  if (!access.subscribed) {
     return res.status(403).json({ error: "subscription_required" });
   }
 

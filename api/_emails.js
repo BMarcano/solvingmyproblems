@@ -90,15 +90,15 @@ function shell({ preview, inner, unsubscribeUrl }) {
 // ---------- the four emails ----------
 
 // Admin invitation: transactional, separate from the marketing sequences.
-export function invitationEmail() {
+export function invitationEmail({ inviteLink = SITE } = {}) {
   return {
     subject: "Your full access to Solving My Problems is ready",
     html: shell({
       preview: "Unlimited readings and the Daily Card are on us.",
       inner: `<p ${H}>You're invited in.</p>
         <p ${P}>We've set aside full access for you, on us: unlimited readings and the Daily Card.</p>
-        <p ${P}>Open Solving My Problems and use this email address. If you're new, your access will switch on as soon as you enter it for your first reading or create an account. If you've already joined, sign in as usual.</p>
-        ${button("Open Solving My Problems &rarr;", SITE)}
+        <p ${P}>Open your private invitation link below. Your access will turn on in that browser automatically. If you already have an account with this email address, sign in there first.</p>
+        ${button("Activate my full access &rarr;", inviteLink)}
         <p ${P}>No payment is needed for this invitation.</p>`,
     }),
   };
