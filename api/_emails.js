@@ -89,6 +89,21 @@ function shell({ preview, inner, unsubscribeUrl }) {
 
 // ---------- the four emails ----------
 
+// Admin invitation: transactional, separate from the marketing sequences.
+export function invitationEmail() {
+  return {
+    subject: "Your full access to Solving My Problems is ready",
+    html: shell({
+      preview: "Unlimited readings and the Daily Card are on us.",
+      inner: `<p ${H}>You're invited in.</p>
+        <p ${P}>We've set aside full access for you, on us: unlimited readings and the Daily Card.</p>
+        <p ${P}>Open Solving My Problems and use this email address. If you're new, your access will switch on as soon as you enter it for your first reading or create an account. If you've already joined, sign in as usual.</p>
+        ${button("Open Solving My Problems &rarr;", SITE)}
+        <p ${P}>No payment is needed for this invitation.</p>`,
+    }),
+  };
+}
+
 // FREE · EMAIL 1 — welcome, right after the email is captured
 export function welcomeEmail({ unsubscribeUrl }) {
   const preview = "15% off forever, because the tools like you already.";

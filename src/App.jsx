@@ -1296,23 +1296,63 @@ function AdminPanel({ onClose }) {
     }
   }
 
+  async function sendInvite(email) {
+    const { data: { session }, error } = await supabase.auth.getSession();
+    if (error || !session?.access_token) throw new Error("Admin session is unavailable");
+    const response = await fetch("/api/send-invite", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ email }),
+    });
+    if (!response.ok) throw new Error(`Invitation failed (${response.status})`);
+  }
+
   async function grantAccess() {
-    const email = compEmail.trim();
+    const email = compEmail.trim().toLowerCase();
     if (!email || compBusy) return;
     setCompBusy(true);
     setCompResult(null);
     const { data, error } = await supabase.rpc("admin_grant_access", { p_email: email, p_note: compNote.trim() || null });
-    setCompBusy(false);
     if (error) {
+      setCompBusy(false);
       setCompResult({ tone: "bad", text: error.message.includes("invalid") ? "That doesn't look like an email." : "Could not grant access — try again." });
       return;
     }
-    if (!data?.registered) setCompResult({ tone: "good", text: `Saved. Unlimited turns on the moment ${data?.email} shows up.` });
-    else if (data?.already_paying) setCompResult({ tone: "good", text: `${data.email} already pays for unlimited — nothing changed, the grant is saved for later.` });
-    else setCompResult({ tone: "good", text: `${data?.email} has unlimited + the Daily Card now.` });
+    let invited = false;
+    if (!data?.already_paying) {
+      try {
+        await sendInvite(data?.email || email);
+        invited = true;
+      } catch (inviteError) {
+        console.error("Invitation could not be sent:", inviteError);
+      }
+    }
+    setCompBusy(false);
+    if (data?.already_paying) setCompResult({ tone: "good", text: `${data.email} already pays for unlimited — nothing changed and no invitation was sent.` });
+    else if (!invited) setCompResult({ tone: "bad", text: `Access was granted to ${email}, but the invitation email failed. Use Re-invite below.` });
+    else if (!data?.registered) setCompResult({ tone: "good", text: `Invitation sent to ${email}. Unlimited turns on when they use this email.` });
+    else setCompResult({ tone: "good", text: `${email} has unlimited + the Daily Card now. Invitation sent.` });
     setCompEmail("");
     setCompNote("");
     load();
+  }
+
+  async function reInvite(email) {
+    if (compBusy) return;
+    setCompBusy(true);
+    setCompResult(null);
+    try {
+      await sendInvite(email);
+      setCompResult({ tone: "good", text: `Invitation sent again to ${email}.` });
+    } catch (error) {
+      console.error("Invitation could not be resent:", error);
+      setCompResult({ tone: "bad", text: `Could not send an invitation to ${email}. Their access grant is still saved.` });
+    } finally {
+      setCompBusy(false);
+    }
   }
 
   async function revokeAccess(email) {
@@ -1371,7 +1411,7 @@ function AdminPanel({ onClose }) {
           <Label>Unlimited access</Label>
           <div className="rounded-2xl p-4 space-y-2.5" style={{ background: P.night, border: "1px solid #2E3060" }}>
             <p className="text-[12px]" style={{ color: P.faint }}>
-              Give someone unlimited readings and the Daily Card, free. Works before they've ever visited — it switches on the moment that email shows up.
+              Give someone unlimited readings and the Daily Card, free, and email them an invitation. It switches on when they use that email.
             </p>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
               <Field label="Email" type="email" autoComplete="off" value={compEmail} onChange={(e) => setCompEmail(e.target.value)} placeholder="email@example.com" />
@@ -1396,6 +1436,7 @@ function AdminPanel({ onClose }) {
                     </span>
                     <span className="flex items-center gap-2 shrink-0">
                       <Pill tone={c.active ? "lavender" : "faint"}>{c.active ? "active" : "waiting"}</Pill>
+                      <button onClick={() => reInvite(c.email)} disabled={compBusy} className="text-[11px] font-bold disabled:opacity-40" style={{ color: P.gold }}>Re-invite</button>
                       <button onClick={() => revokeAccess(c.email)} disabled={compBusy} className="text-[11px] font-bold" style={{ color: P.rose }}>Remove</button>
                     </span>
                   </div>
@@ -1471,4 +1512,3 @@ DEV NOTES (Brayan) — production scope for the features above
   ledger table), sub $4.99/mo. First reading requires NO login — create
   anonymous session, attach email only at purchase.
 ------------------------------------------------------------------- */
-
