@@ -1,4 +1,5 @@
 // Admin-only invitation for an email already granted complimentary access.
+import { createHash, timingSafeEqual } from "node:crypto";
 import { deliver, invitationEmail, SITE } from "./_emails.js";
 import { createInvitationToken } from "./_invite-token.js";
 
@@ -18,23 +19,35 @@ export default async function handler(req, res) {
 
   const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
   const anonKey = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
-  if (!supabaseUrl || !anonKey || !process.env.RESEND_API_KEY) {
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const isMaintenance = Boolean(serviceRoleKey) && timingSafeEqual(
+    createHash("sha256").update(token).digest(),
+    createHash("sha256").update(serviceRoleKey).digest(),
+  );
+  if (!supabaseUrl || (!isMaintenance && !anonKey) || !process.env.RESEND_API_KEY) {
     console.error("send-invite: Supabase or Resend is not configured");
     return res.status(503).json({ error: "Invitation email is not configured" });
   }
 
   try {
-    // The RPC is gated by is_admin() and exposes only saved grants. Supabase
-    // verifies the caller's JWT, so this cannot email an arbitrary address.
-    const grantsResponse = await fetch(`${supabaseUrl.replace(/\/$/, "")}/rest/v1/rpc/admin_comp_list`, {
-      method: "POST",
-      headers: {
-        apikey: anonKey,
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: "{}",
-    });
+    // Maintenance callers must already possess this project's server key.
+    // Query only the requested saved grant; possession never authorizes an
+    // invitation to an arbitrary recipient. Browser admins keep the gated RPC.
+    const baseUrl = supabaseUrl.replace(/\/$/, "");
+    const grantQuery = new URLSearchParams({ select: "email,created_at", email: `eq.${email}`, limit: "1" });
+    const grantsResponse = isMaintenance
+      ? await fetch(`${baseUrl}/rest/v1/comp_access?${grantQuery}`, {
+        headers: { apikey: serviceRoleKey, Authorization: `Bearer ${serviceRoleKey}` },
+      })
+      : await fetch(`${baseUrl}/rest/v1/rpc/admin_comp_list`, {
+        method: "POST",
+        headers: {
+          apikey: anonKey,
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+      });
     if (grantsResponse.status === 401) return res.status(401).json({ error: "Session expired" });
     if (!grantsResponse.ok) {
       console.error("send-invite: grant lookup failed", grantsResponse.status, await grantsResponse.text());
